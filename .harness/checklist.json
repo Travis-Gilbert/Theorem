@@ -1,86 +1,150 @@
 {
   "schema_version": 1,
-  "source": "theorems-harness planning-theorem skill",
-  "created_at": "2026-06-30T00:00:00Z",
-  "task": "SPEC-IROH-BLAKE3-FEDERATION-TRANSPORT: direct peer-to-peer federation lane using Iroh for node identity/QUIC, iroh-blobs BLAKE3 transfer links over unchanged sha256 identity, SubstratePeer delta freshness, iroh-gossip awareness, per-peer trust policy, and an opt-in driver/doctor surface.",
-  "source_path": "/Users/travisgilbert/Downloads/SPEC-IROH-BLAKE3-FEDERATION-TRANSPORT.md",
-  "source_hash": "spec:iroh-blake3-federation-transport@2026-06-30",
-  "repo": "Theorem",
-  "branch": "main",
+  "tenant_slug": "Travis-Gilbert",
+  "room_id": "carry-local-wedge",
+  "sources": [
+    "/Users/travisgilbert/Downloads/HANDOFF-CARRY-LOCAL-WEDGE.md"
+  ],
+  "created_at": "2026-07-01",
+  "planning_skill": "theorems-harness:planning-theorem",
+  "execution_skill": "theorems-harness:execute",
   "coordination_mirror": {
-    "status": "mirrored_as_intent",
+    "status": "mirrored",
     "room_id": "Theorem",
-    "tenant_slug": "Travis-Gilbert"
+    "record": "doc_82e66db1cf2de86d"
   },
   "items": [
     {
-      "id": "PT-000",
-      "deliverable": "Verify first: pin compatible iroh, iroh-blobs, and iroh-gossip crate versions in a standalone app crate, prove they build independently, and bind implementation choices to current docs/crate metadata.",
-      "acceptance_criterion": "apps/theorem-federation/Cargo.toml pins a compatible iroh family; cargo check/test for that crate resolves the dependency graph; implementation notes name any API mismatch around external outboards or relay proof.",
-      "status": "complete",
-      "verification": "Pinned iroh 1.0.1, iroh-blobs 0.103.0, and iroh-gossip 0.101.0 in apps/theorem-federation/Cargo.toml. cargo info showed all require Rust 1.91; local rustc is 1.95.0. CARGO_TARGET_DIR='/Volumes/SSD Samsung/cargo-targets/theorem-federation' cargo test --manifest-path apps/theorem-federation/Cargo.toml passed 10 tests, including live federation_network integration tests; cargo clippy --all-targets --no-deps -- -D warnings passed.",
-      "deferral_reason": ""
-    },
-    {
       "id": "PT-001",
-      "deliverable": "D1. Peer identity as the iroh endpoint.",
-      "acceptance_criterion": "A node started twice on the same data dir presents the same EndpointId. Two configured peers have a dialable identity surface for authenticated QUIC under the federation ALPN.",
+      "source": "HANDOFF-CARRY-LOCAL-WEDGE",
+      "title": "The local, no-account RustyRed node",
+      "acceptance": "Starting the local node and running the CLI in a repo opens or creates a project-scoped store on disk, verified by a write and a read-back over the local MCP endpoint with no tenant and no token; a second repo opens an isolated store; the node is reachable only on loopback.",
       "status": "partial",
-      "verification": "identity_is_stable_for_data_dir passes. authenticated_quic_stream_applies_structured_and_text_delta binds two loopback Iroh endpoints under ALPN theorem/federation/1, asserts the remote EndpointId on both sides, opens an authenticated QUIC stream, and exchanges federation frames. theorem-federation doctor --bind-endpoint with THEOREM_FEDERATION_ENABLED=1 bound an N0 endpoint and reported relay mode n0_public_relays reachable.",
-      "deferral_reason": "Two physical nodes on different networks were not run in this session, so cross-network hole-punch versus relay-routed behavior remains not-run."
+      "verification_evidence": [
+        "Validated carry_data_dir derives distinct project-scoped stores for two source roots.",
+        "Validated live loopback MCP write/read on 127.0.0.1:18380 using tenantless upsert_note and observe calls.",
+        "Validated scripts/theorem carry data-dir and mcp-url wrappers."
+      ],
+      "deferral_reason": "Not yet run as a full theorem carry up lifecycle from a clean repo; local MCP and data-dir contracts were proven directly.",
+      "routes": [
+        "apps/theorem-proxy/scripts/node-local.sh",
+        "scripts/theorem",
+        "rustyredcore_THG/hooks/carry-local.sh",
+        "rustyredcore_THG/crates/rustyred-thg-server/src/config.rs",
+        "rustyredcore_THG/crates/rustyred-thg-server/src/router.rs"
+      ],
+      "validation": [
+        "Start with THEOREM_CARRY_HOME on a temp dir and THEOREM_MCP_URL on loopback.",
+        "Call tools/call upsert_note with no tenant or token, then observe or recall it back.",
+        "Repeat from a second temp repo and prove the derived data_dir differs.",
+        "Assert bind address is 127.0.0.1."
+      ],
+      "risk": "A single global node can accidentally mix project memory unless repo identity is part of the data-dir or project slug."
     },
     {
       "id": "PT-002",
-      "deliverable": "D2. The blob lane, convergence and bootstrap.",
-      "acceptance_criterion": "A sha256-addressed pack/object/document can be mapped to a Blake3 transfer link without rewriting sha256 identity, verified on receipt, and represented as the source for the existing graph-version checkout/bootstrap path.",
+      "source": "HANDOFF-CARRY-LOCAL-WEDGE",
+      "title": "Session-activity capture",
+      "acceptance": "A Claude Code session in a repo produces graph nodes for the tools used and files edited, each with a timestamp and session provenance and linked to the project; a Codex session in the same repo produces the same; a forced failure with the node down leaves the session uninterrupted.",
       "status": "partial",
-      "verification": "BlobResolver records sha256:<hex> identity and blake3:<hex> transfer links for canonical bytes, resolves both directions, and verify_transfer_boundary rejects changed bytes. iroh_blobs_transfers_pack_bytes_and_records_dual_hash_boundary starts a real iroh-blobs provider over a loopback Iroh Router, downloads by BlobTicket into a second MemStore, reads bytes back with get_bytes, and records the sha256/BLAKE3 boundary through the trust-gated peer accept path.",
-      "deferral_reason": "Interrupted/resumable transfer recovery, cold-node graph-version checkout from a peer, and externally owned outboard over existing sha256 files were not run."
+      "verification_evidence": [
+        "Stub MCP captured a PostToolUse payload through carry-capture.sh as upsert_note with session, tool, file, repo, and metadata.",
+        "Node-down capture against 127.0.0.1:9 exited 0.",
+        "Installer fixtures registered Claude and Codex SessionStart, UserPromptSubmit, PostToolUse, and Stop managed hooks."
+      ],
+      "deferral_reason": "Not yet validated by running real Claude Code and Codex sessions end-to-end.",
+      "routes": [
+        "rustyredcore_THG/hooks/carry-capture.sh",
+        "rustyredcore_THG/hooks/carry-local.sh",
+        "packaging/carry/install.sh",
+        "/Users/travisgilbert/.codex/plugins/cache/codex-marketplace/theorems-harness/0.6.0/hooks/codex-hooks.json",
+        "/Users/travisgilbert/.codex/plugins/cache/codex-marketplace/theorems-harness/0.6.0/hooks/hooks.json"
+      ],
+      "validation": [
+        "Run hook JSON fixtures for PostToolUse and UserPromptSubmit through carry-capture.sh with a stub MCP endpoint.",
+        "Run the same script with an unreachable endpoint and assert exit 0.",
+        "Inspect written upsert_note metadata for event, session, repo, file, tool, and timestamp fields."
+      ],
+      "risk": "Codex and Claude hook payloads differ; capture must be liberal and fail-open."
     },
     {
       "id": "PT-003",
-      "deliverable": "D3. The delta lane, freshness.",
-      "acceptance_criterion": "Federation frames carry SubstratePeer structured StampedBatch deltas and yrs update_v1 bytes without changing SubstratePeer merge functions; frame encode/decode is tested and bounded.",
+      "source": "HANDOFF-CARRY-LOCAL-WEDGE",
+      "title": "Session-memory serve and compaction survival",
+      "acceptance": "Starting a new session in a repo with prior history injects a bounded capsule containing prior decisions and touched-file context in addition to the code map; calling the retrieval tool returns relevant session memory; after a forced compaction, re-pulling via the tool returns the pre-compaction state and the session continues oriented.",
       "status": "partial",
-      "verification": "FederationFrame carries StampedBatch, text update_v1/state-vector bytes, and PeerEvent presence. delta_frame_round_trips_over_length_prefixed_stream passed over a tokio duplex stream with an 8 MiB frame cap. authenticated_quic_stream_applies_structured_and_text_delta moves structured and text deltas over a real Iroh QUIC stream, applies them through apply_inbound_frame into SubstratePeer, sends a concurrent server-side structured delta back over the same stream, and asserts the local exchange completes under one second with both edits retained.",
-      "deferral_reason": "The full version-log assertion against graph-version checkout state was not run; the local SubstratePeer convergence oracle verifies retained merged object properties."
+      "verification_evidence": [
+        "carry-serve.sh stub returned a bounded Session memory capsule from observe recall_results.",
+        "session_start.sh local mode injected carry memory and the existing compute_code code neighborhood without THEOREM_TENANT_ID.",
+        "Tenantless live local MCP write/read validated the seed and retrieve path."
+      ],
+      "deferral_reason": "Forced compaction survival was not exercised in a live agent session.",
+      "routes": [
+        "rustyredcore_THG/hooks/session_start.sh",
+        "rustyredcore_THG/hooks/carry-serve.sh",
+        "rustyredcore_THG/hooks/carry-local.sh",
+        "rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "Seed a local note with upsert_note.",
+        "Run session_start.sh with no THEOREM_TENANT_ID and local MCP env.",
+        "Assert stdout includes a bounded session-memory capsule.",
+        "Call observe with query and assert the seeded memory returns."
+      ],
+      "risk": "The existing session_start.sh exits early without THEOREM_TENANT_ID; local mode must bypass that hosted-only gate without breaking hosted behavior."
     },
     {
       "id": "PT-004",
-      "deliverable": "D4. Awareness across a mesh.",
-      "acceptance_criterion": "Presence events are encoded for a deterministic iroh-gossip TopicId derived from tenant/scope, so three peers can join the same awareness topic without pairwise fanout.",
-      "status": "complete",
-      "verification": "awareness_topic_id deterministically derives an iroh_gossip::TopicId from tenant/scope, and AwarenessMessage encodes/decodes PeerEvent::Presence. three_peer_gossip_mesh_delivers_awareness_payload binds three loopback Iroh endpoints, routes iroh-gossip through Routers, bootstraps the mesh with MemoryLookup, broadcasts an encoded PeerEvent::Presence, and verifies both other peers receive and decode it.",
-      "deferral_reason": ""
+      "source": "HANDOFF-CARRY-LOCAL-WEDGE",
+      "title": "Consolidation on session end",
+      "acceptance": "After a session ends, its raw observations are consolidated into a durable summary node linked to the touched files and the decisions, and the next session's injected capsule reflects the consolidation rather than the raw observation stream.",
+      "status": "partial",
+      "verification_evidence": [
+        "Stop, SessionEnd, and PreCompact paths in carry-capture.sh write a session_summary marker through upsert_note.",
+        "Source review found rustyred-thg-memory consolidation APIs but no dedicated public carry MCP consolidate tool to call directly."
+      ],
+      "deferral_reason": "Raw-observation consolidation into a lower-priority durable MemorySummary remains partial until the actual public MCP consolidation operation is exposed or confirmed.",
+      "routes": [
+        "rustyredcore_THG/hooks/carry-capture.sh",
+        "rustyredcore_THG/hooks/carry-local.sh",
+        "rustyredcore_THG/crates/rustyred-thg-memory/src/lib.rs",
+        "rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "Run Stop hook fixture after multiple captured observations.",
+        "Call memory.consolidate or the MCP memory consolidate surface against local node.",
+        "Read back a MemorySummary node or observe capsule that includes the summary.",
+        "Assert raw observations are archived or lower priority."
+      ],
+      "risk": "The public MCP tool list exposes memory lifecycle through plugin operations, not a dedicated carry endpoint; script must call the actual advertised operation."
     },
     {
       "id": "PT-005",
-      "deliverable": "D5. Trust as policy over the transport.",
-      "acceptance_criterion": "A per-EndpointId EMA trust table rejects below-floor inbound blob/delta contributions before merge and admits above-floor contributions without modifying CRDT merge code.",
-      "status": "complete",
-      "verification": "TrustPolicy records EMA outcomes by EndpointId, rejects below-floor peers via require_inbound, and admits the same peer when the floor is adjusted. apply_inbound_frame calls require_inbound before merge/text apply, BlobResolver::record_bytes_from_peer calls require_inbound before recording received bytes, authenticated_quic_stream_applies_structured_and_text_delta proves above-floor reconciliation, and trust_rejection_prevents_delta_and_blob_acceptance proves below-floor delta/blob rejection leaves merge state and resolver mappings unchanged.",
-      "deferral_reason": ""
-    },
-    {
-      "id": "PT-006",
-      "deliverable": "D6. The federation driver and the relay.",
-      "acceptance_criterion": "A default-off driver reads federation config, reports endpoint/relay/peer status through theorem-federation and scripts/theorem, and can bind the endpoint when explicitly enabled.",
+      "source": "HANDOFF-CARRY-LOCAL-WEDGE",
+      "title": "One-command install",
+      "acceptance": "On a clean machine, one command installs the product, and with no further configuration a subsequent Claude Code or Codex session in a repo is captured and a later session in that repo is served from the local node; uninstall removes the registered hooks and leaves the agents working.",
       "status": "partial",
-      "verification": "theorem-federation status is default-off and reports identity/relay/peer warnings. scripts/theorem federation status succeeded with a temp data dir. THEOREM_FEDERATION_ENABLED=1 theorem-federation doctor --bind-endpoint bound an endpoint and reported reachable relay mode.",
-      "deferral_reason": "Configured peer dialing, connected vs relay-routed peer status, and forced relay fallback with no data loss were not run."
-    },
-    {
-      "id": "PT-007",
-      "deliverable": "Doc and wrapper integration.",
-      "acceptance_criterion": "CLAUDE.md and docs/site/reference/apps.md document apps/theorem-federation; scripts/theorem exposes federation commands without disrupting the existing dirty graph/Yazi command; doc drift is refreshed.",
-      "status": "complete",
-      "verification": "Updated CLAUDE.md, docs/site/reference/apps.md, scripts/theorem, and .harness/doc-map-baseline.apps. bash -n scripts/theorem, git diff --check for this slice, ./scripts/check-doc-drift.sh --refresh, and ./scripts/check-doc-drift.sh --full all passed.",
-      "deferral_reason": ""
+      "verification_evidence": [
+        "packaging/carry/install.sh install, status, and uninstall passed against temp Claude and Codex config files.",
+        "Managed hook entries cover SessionStart, UserPromptSubmit, PostToolUse, and Stop for both agents, and uninstall removes only managed entries.",
+        "packaging/carry/README.md documents install, uninstall, status, and the no-tenant/no-token requirement."
+      ],
+      "deferral_reason": "Clean-machine install and real follow-up agent session were not run.",
+      "routes": [
+        "packaging/carry/install.sh",
+        "packaging/carry/README.md",
+        "rustyredcore_THG/hooks/carry-capture.sh",
+        "rustyredcore_THG/hooks/session_start.sh",
+        "/Users/travisgilbert/.claude/settings.json",
+        "/Users/travisgilbert/.codex/hooks.json"
+      ],
+      "validation": [
+        "Run install into temp HOME/CODEX_HOME/CLAUDE_HOME.",
+        "Assert Claude and Codex hook manifests include session start, prompt, post-tool, and stop capture commands.",
+        "Run uninstall and assert the managed block is removed.",
+        "No tenant, token, or network env is required."
+      ],
+      "risk": "Installer must not overwrite existing user hooks; it needs managed blocks or a reversible backup."
     }
-  ],
-  "execution_receipt": {
-    "updated_at": "2026-07-01T00:00:00Z",
-    "actor": "codex",
-    "note": "Extended the standalone Iroh federation lane from scaffold to local live proofs: authenticated QUIC frame exchange, bidirectional SubstratePeer convergence, real iroh-blobs provider/get transfer, three-peer gossip awareness, and trust-gated blob/delta acceptance. Remaining gaps require multi-node NAT/relay, interrupted resume, and graph-version bootstrap labs."
-  }
+  ]
 }

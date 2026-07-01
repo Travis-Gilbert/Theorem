@@ -19,6 +19,8 @@
 #   THEOREM_TENANT_ID    tenant scope (required; no tenant => no injection)
 #   THEOREM_MCP_URL      MCP JSON-RPC endpoint (default: the product server /mcp)
 #   THEOREM_API_TOKEN    optional bearer token for the endpoint
+#   THEOREM_CARRY_ENABLED local no-account mode; uses THEOREM_CARRY_TENANT or "local"
+#                         and defaults the MCP endpoint to localhost.
 #   THEOREM_CONTEXT_TASK optional task string the pack is conditioned on
 #   THEOREM_CONTEXT_BUDGET_TOKENS  token budget for the pack (default 2000)
 
@@ -27,15 +29,24 @@ _membrane_reflex() {
   command -v git >/dev/null 2>&1 || return 0
   command -v python3 >/dev/null 2>&1 || return 0
 
-  local repo_root sha tenant mcp_url token task budget repo_url repo_id
+  local repo_root sha tenant mcp_url token task budget repo_url repo_id script_dir carry_enabled
   repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
   [ -n "$repo_root" ] || return 0
   sha=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || return 0
+  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || script_dir=""
 
+  carry_enabled=${THEOREM_CARRY_ENABLED:-0}
   tenant=${THEOREM_TENANT_ID:-}
+  if [ -z "$tenant" ] && [ "$carry_enabled" != "0" ]; then
+    tenant=${THEOREM_CARRY_TENANT:-local}
+  fi
   [ -n "$tenant" ] || return 0  # no tenant scope => nothing to inject
 
-  mcp_url=${THEOREM_MCP_URL:-https://rustyredcore-theorem-production.up.railway.app/mcp}
+  if [ "$carry_enabled" != "0" ] && [ -z "${THEOREM_MCP_URL:-}" ]; then
+    mcp_url=${THEOREM_CARRY_MCP_URL:-http://127.0.0.1:${RUSTY_RED_PORT:-8380}/mcp}
+  else
+    mcp_url=${THEOREM_MCP_URL:-https://rustyredcore-theorem-production.up.railway.app/mcp}
+  fi
   token=${THEOREM_API_TOKEN:-}
   task=${THEOREM_CONTEXT_TASK:-}
   budget=${THEOREM_CONTEXT_BUDGET_TOKENS:-2000}
@@ -44,6 +55,14 @@ _membrane_reflex() {
   # fall back to the directory name as the repo id.
   repo_url=$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)
   repo_id=$(basename "$repo_root")
+
+  if [ "$carry_enabled" != "0" ] && [ -n "$script_dir" ] && [ -x "$script_dir/carry-serve.sh" ]; then
+    THEOREM_REPO="$repo_root" \
+    THEOREM_CARRY_MCP_URL="$mcp_url" \
+    THEOREM_CARRY_AGENT="${THEOREM_CARRY_AGENT:-}" \
+    THEOREM_CONTEXT_TASK="$task" \
+    "$script_dir/carry-serve.sh" 2>/dev/null || true
+  fi
 
   THEOREM_MCP_URL="$mcp_url" \
   THEOREM_API_TOKEN="$token" \
