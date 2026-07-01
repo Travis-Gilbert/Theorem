@@ -31,6 +31,7 @@ Commands:
   up                       Start local RustyRed node plus model-path proxy.
   proxy [proxy args...]    Start the Anthropic Messages proxy on localhost.
   graph <command> [args...] Query file graph context for Yazi and shell workflows.
+  carry <command> [args...] Install, run, or inspect local no-account Carry hooks.
   federation <command> [args...]
                            Inspect or run the opt-in Iroh federation lane.
   connect <claude|codex> [--check]
@@ -477,6 +478,72 @@ cmd_federation() {
     local repo
     repo="$(find_repo)"
     cargo run --manifest-path "$repo/apps/theorem-federation/Cargo.toml" -- "$@"
+}
+
+cmd_carry() {
+    local subcommand=${1:-status}
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    local repo
+    repo="$(find_repo)"
+    local installer="$repo/packaging/carry/install.sh"
+    local hook_dir="$repo/rustyredcore_THG/hooks"
+
+    case "$subcommand" in
+        install | uninstall | status)
+            THEOREM_REPO="$repo" "$installer" "$subcommand" "$@"
+            ;;
+        up)
+            # shellcheck source=../rustyredcore_THG/hooks/carry-local.sh
+            source "$hook_dir/carry-local.sh"
+            local data_dir
+            data_dir="$(carry_data_dir)"
+            mkdir -p "$data_dir"
+            log "carry data dir: $data_dir"
+            RUSTY_RED_DATA_DIR="$data_dir" \
+                RUSTY_RED_REQUIRE_AUTH=false \
+                RUSTY_RED_MCP_ENABLED=true \
+                start_local_node
+            printf 'Carry MCP URL: %s\n' "$(node_base_url)/mcp"
+            ;;
+        data-dir)
+            # shellcheck source=../rustyredcore_THG/hooks/carry-local.sh
+            source "$hook_dir/carry-local.sh"
+            carry_data_dir
+            ;;
+        mcp-url)
+            # shellcheck source=../rustyredcore_THG/hooks/carry-local.sh
+            source "$hook_dir/carry-local.sh"
+            carry_mcp_url
+            ;;
+        serve)
+            THEOREM_REPO="$repo" "$hook_dir/carry-serve.sh" "$@"
+            ;;
+        capture)
+            THEOREM_REPO="$repo" "$hook_dir/carry-capture.sh" "$@"
+            ;;
+        -h | --help | help)
+            cat <<'EOF'
+usage: theorem carry <command>
+
+Commands:
+  install      Register managed Claude Code and Codex lifecycle hooks.
+  uninstall    Remove managed Carry hooks.
+  status       Print managed hook counts.
+  up           Start/reuse the loopback local RustyRed MCP node for this repo.
+  data-dir     Print this repo's project-scoped Carry data directory.
+  mcp-url      Print the MCP URL the hooks target.
+  serve        Run the session-memory serve hook once.
+  capture      Run the capture hook, reading hook JSON from stdin.
+EOF
+            ;;
+        *)
+            log "unknown carry command $subcommand"
+            return 1
+            ;;
+    esac
 }
 
 cmd_harness() {
@@ -1601,6 +1668,9 @@ main() {
             ;;
         graph)
             cmd_graph "$@"
+            ;;
+        carry)
+            cmd_carry "$@"
             ;;
         federation)
             cmd_federation "$@"
