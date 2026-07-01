@@ -43,10 +43,11 @@ use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, compile_graphql_selection, compile_user_subgraph,
     diff_graph_snapshots, epistemic_shadow_ppr, execute_query_with_resolver, graph_version_log,
     merge_graph_snapshots, read_epistemic_shadow, run_epistemic_cron_pass, update_graph_ref_cas,
-    CodeKgManifest, Direction, EdgeRecord, EpistemicAnnotations, EpistemicCronInput,
-    EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicType,
-    FusionPolicy, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
-    GraphStoreError, GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
+    CodeKgManifest, DataDegradedState, DataFilterOperator, DataLink, DataRecord, DataResult,
+    DataTrace, Direction, EdgeRecord, EpistemicAnnotations, EpistemicCronInput, EpistemicEnricher,
+    EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicType, FusionPolicy,
+    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
+    GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
     HybridScoringConfig, InMemoryGraphStore, MemoryDocumentQuery, ModalityResolver, NeighborHit,
     NeighborQuery, NodeQuery, NodeRecord, PluginRegistry, QueryIr, RankOutcome, RankedRow,
     RedCoreGraphStore, RelationalStore, SessionDelta, StreamEvent, StreamLog, StreamUrgency,
@@ -1470,6 +1471,16 @@ fn call_tool<P: McpGraphProvider>(
         }
         "rustyred_thg_graph_explain" => explain_payload(&tenant, &arguments),
         "rustyred_thg_graph_query" => query_payload(&tenant, &backend, &arguments)?,
+        "query_data" | "data_query" => {
+            data_api_payload(&tenant, &mut backend, &arguments, "query")?
+        }
+        "retrieve_memory" | "memory_retrieve" => {
+            data_api_payload(&tenant, &mut backend, &arguments, "retrieve")?
+        }
+        "turn_start" | "turn_start_context" => {
+            turn_start_payload(&tenant, &mut backend, &arguments)?
+        }
+        "evidence_bundle" => evidence_bundle_payload(&tenant, &mut backend, &arguments)?,
         "rustyred_thg_relational_query" | "rustyred_relational_query" => {
             relational_query_payload(&tenant, &backend, &arguments)?
         }
@@ -2168,6 +2179,16 @@ fn call_tool<P: McpGraphProvider>(
             }
             reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "port")?
         }
+        "reconstruct" | "theorem_harness_reconstruct" => {
+            let mode = reconstruct_mode(&arguments)?;
+            if reconstruct_mode_writes(&mode, &arguments) && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reconstruct may write source, binary, or Datawave facts; it is unavailable while read-only mode is active for this mode."
+                })));
+            }
+            reconstruct_payload(&tenant, &mut backend, &arguments, &mode)?
+        }
         "code_search"
         | "compute_code"
         | "code_ingest"
@@ -2197,6 +2218,10 @@ fn call_tool<P: McpGraphProvider>(
             }
             code_search_payload(&tenant, &mut backend, &arguments, &operation)?
         }
+        "understand_code" => understand_code_payload(&tenant, &mut backend, &arguments)?,
+        "impact" => impact_payload(&tenant, &backend, &arguments)?,
+        "oracle" => oracle_payload(&tenant, &mut backend, &arguments, config.read_only)?,
+        "observe_web" => observe_web_payload(&tenant, &mut backend, &arguments, config.read_only)?,
         "reconstruct_binary" | "theorem_harness_reconstruct_binary" => {
             let operation = reconstruct_binary_operation(&arguments)?;
             if reconstruct_binary_writes_graph(&operation) && config.read_only {
@@ -3847,6 +3872,846 @@ fn relational_query_payload(
             "relations": store.relations().map(|relation| relation.schema.relation.clone()).collect::<Vec<_>>()
         }
     }))
+}
+
+pub fn data_api_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    match operation {
+        "schema" => data_schema_payload(tenant, backend),
+        "record" => data_record_payload(tenant, backend, arguments),
+        "links" => data_links_payload(tenant, backend, arguments),
+        "retrieve" => data_retrieve_payload(tenant, backend, arguments),
+        "records" | "query" => data_query_payload(tenant, backend, arguments),
+        "views" => data_views_payload(tenant, backend, arguments),
+        "view" | "data_view" => data_view_payload(tenant, backend, arguments),
+        "upsert_view" | "upsertDataView" => data_upsert_view_payload(tenant, backend, arguments),
+        other => Err(McpError::invalid_params(format!(
+            "unsupported Data API operation {other}"
+        ))),
+    }
+}
+
+fn data_schema_payload(tenant: &str, backend: &impl McpGraphBackend) -> Result<Value, McpError> {
+    let stats = backend.stats()?;
+    Ok(json!({
+        "tenant": tenant,
+        "schema": "rustyred-data-api-v1",
+        "collections": [
+            { "name": "memory_docs", "label": "MemoryDocument" },
+            { "name": "code_files", "label": "CodeFile" },
+            { "name": "code_symbols", "label": "CodeSymbol" },
+            { "name": "coordination_records", "label": "CoordinationRecord" },
+            { "name": "jobs", "label": "Job" },
+            { "name": "web_pages", "label": "RustyWebPage" },
+            { "name": "data_views", "label": "DataView" },
+            { "name": "graph_nodes", "label": null }
+        ],
+        "envelope": {
+            "records": "array<DataRecord>",
+            "cursor": "offset cursor",
+            "trace": "DataTrace",
+            "degraded": "array<DataDegradedState>"
+        },
+        "labels": backend.labels()?,
+        "edge_types": backend.edge_types()?,
+        "property_keys": backend.property_keys()?,
+        "stats": {
+            "version": stats.version,
+            "nodes_total": stats.nodes_total,
+            "edges_total": stats.edges_total,
+            "labels_total": stats.labels_total,
+            "edge_types_total": stats.edge_types_total,
+            "property_keys_total": stats.property_keys_total
+        }
+    }))
+}
+
+fn data_record_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let id = argument_text(
+        arguments,
+        &["record_id", "recordId", "id", "node_id", "nodeId"],
+    )
+    .ok_or_else(|| McpError::invalid_params("data record lookup requires id"))?;
+    let hydrate_links = data_hydrate_links(arguments);
+    let node = backend.get_node(&id)?.ok_or_else(|| {
+        McpError::invalid_params(format!("data record {id} was not found in tenant {tenant}"))
+    })?;
+    let record = data_record_from_node(backend, &node, hydrate_links, data_link_limit(arguments))?;
+    let mut result = DataResult::default();
+    result.records = vec![record];
+    result.trace = DataTrace {
+        tenant: Some(tenant.to_string()),
+        collection: None,
+        label: None,
+        filters_applied: vec![format!("id={id}")],
+        candidate_count: 1,
+        returned_count: 1,
+        broad_scan: false,
+        source: "dataRecord".to_string(),
+        stats: BTreeMap::new(),
+    };
+    data_result_to_value(result)
+}
+
+fn data_links_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let id = argument_text(
+        arguments,
+        &["record_id", "recordId", "id", "node_id", "nodeId"],
+    )
+    .ok_or_else(|| McpError::invalid_params("data links lookup requires id"))?;
+    let direction =
+        argument_text(arguments, &["direction", "dir"]).unwrap_or_else(|| "both".to_string());
+    let links = data_links_for_node(backend, &id, &direction, data_link_limit(arguments))?;
+    let returned_count = links.len();
+    Ok(json!({
+        "tenant": tenant,
+        "record_id": id,
+        "links": links,
+        "trace": {
+            "source": "dataLinks",
+            "direction": direction,
+            "returned_count": returned_count
+        }
+    }))
+}
+
+fn data_retrieve_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut query_args = arguments.clone();
+    if !query_args.is_object() {
+        query_args = json!({});
+    }
+    let object = query_args.as_object_mut().expect("data query object");
+    object
+        .entry("collection".to_string())
+        .or_insert_with(|| json!("memory_docs"));
+    let mut filters = object
+        .remove("filters")
+        .or_else(|| object.remove("where"))
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for (arg_key, field) in [
+        ("project", "project_slug"),
+        ("project_slug", "project_slug"),
+        ("repo", "repo"),
+        ("repo_id", "repo_id"),
+        ("path", "path"),
+        ("source", "source"),
+        ("room", "room_id"),
+        ("room_id", "room_id"),
+        ("status", "status"),
+        ("validity", "validity"),
+    ] {
+        if let Some(value) = arguments
+            .get(arg_key)
+            .cloned()
+            .filter(|value| !value.is_null())
+        {
+            filters.push(json!({ "field": field, "op": "equals", "value": value }));
+        }
+    }
+    if let Some(tags) = arguments.get("tags").and_then(Value::as_array) {
+        for tag in tags {
+            if let Some(tag) = tag.as_str().map(str::trim).filter(|tag| !tag.is_empty()) {
+                filters.push(json!({ "field": "tags", "op": "contains", "value": tag }));
+            }
+        }
+    }
+    if let Some(query) = arguments
+        .get("query")
+        .or_else(|| arguments.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        filters.push(json!({ "field": "content", "op": "contains", "value": query }));
+    }
+    object.insert("filters".to_string(), Value::Array(filters));
+    data_query_payload(tenant, backend, &query_args)
+}
+
+fn data_views_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let limit = argument_u64(arguments, &["limit"])
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(100)
+        .min(500);
+    let query = NodeQuery::label("DataView")
+        .with_property("tenant_slug", Value::String(tenant.to_string()))
+        .with_limit(limit);
+    let mut nodes = backend.query_nodes(query)?;
+    nodes.sort_by(|left, right| {
+        data_sort_value(right, "updated_at_ms")
+            .cmp(&data_sort_value(left, "updated_at_ms"))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let records = nodes
+        .iter()
+        .map(DataRecord::from_node)
+        .collect::<Vec<DataRecord>>();
+    data_result_to_value(DataResult {
+        records,
+        cursor: None,
+        trace: DataTrace {
+            tenant: Some(tenant.to_string()),
+            collection: Some("data_views".to_string()),
+            label: Some("DataView".to_string()),
+            filters_applied: vec!["tenant_slug".to_string()],
+            candidate_count: nodes.len(),
+            returned_count: nodes.len(),
+            broad_scan: false,
+            source: "dataViews".to_string(),
+            stats: data_trace_stats(backend, 0, limit),
+        },
+        degraded: Vec::new(),
+    })
+}
+
+fn data_view_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let view_id = data_view_arg_id(arguments)?;
+    let node_id = data_view_node_id(tenant, &view_id);
+    let node = backend
+        .get_node(&node_id)?
+        .ok_or_else(|| McpError::invalid_params(format!("data view `{view_id}` was not found")))?;
+    let run = arguments
+        .get("run")
+        .or_else(|| arguments.get("rerun"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let record = DataRecord::from_node(&node);
+    if !run {
+        let mut result = DataResult::default();
+        result.records = vec![record];
+        result.trace = DataTrace {
+            tenant: Some(tenant.to_string()),
+            collection: Some("data_views".to_string()),
+            label: Some("DataView".to_string()),
+            filters_applied: vec![format!("view_id={view_id}")],
+            candidate_count: 1,
+            returned_count: 1,
+            broad_scan: false,
+            source: "dataView".to_string(),
+            stats: data_trace_stats(backend, 0, 1),
+        };
+        return data_result_to_value(result);
+    }
+    let query = node
+        .properties
+        .get("query")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| McpError::internal("saved Data View omitted query object"))?;
+    let mut result = data_query_payload(tenant, backend, &query)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "view".to_string(),
+            serde_json::to_value(record).unwrap_or(Value::Null),
+        );
+    }
+    Ok(result)
+}
+
+fn data_upsert_view_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let view_id = data_view_arg_id(arguments)?;
+    let query = arguments
+        .get("query")
+        .or_else(|| arguments.get("data_query"))
+        .or_else(|| arguments.get("dataQuery"))
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| McpError::invalid_params("upsertDataView requires query object"))?;
+    let now = now_unix_ms();
+    let node_id = data_view_node_id(tenant, &view_id);
+    let created_at_ms = backend
+        .get_node(&node_id)?
+        .and_then(|node| node.properties.get("created_at_ms").and_then(Value::as_i64))
+        .unwrap_or(now);
+    let mut properties = Map::new();
+    properties.insert("tenant_slug".to_string(), json!(tenant));
+    properties.insert("view_id".to_string(), json!(view_id));
+    properties.insert(
+        "title".to_string(),
+        arguments
+            .get("title")
+            .cloned()
+            .unwrap_or_else(|| json!(view_id)),
+    );
+    properties.insert("query".to_string(), query);
+    properties.insert("created_at_ms".to_string(), json!(created_at_ms));
+    properties.insert("updated_at_ms".to_string(), json!(now));
+    if let Some(description) = arguments.get("description").cloned() {
+        properties.insert("description".to_string(), description);
+    }
+    let node = NodeRecord::new(node_id, ["DataView"], Value::Object(properties));
+    backend.upsert_node(node.clone())?;
+    let mut result = DataResult::default();
+    result.records = vec![DataRecord::from_node(&node)];
+    result.trace = DataTrace {
+        tenant: Some(tenant.to_string()),
+        collection: Some("data_views".to_string()),
+        label: Some("DataView".to_string()),
+        filters_applied: vec![format!("view_id={view_id}")],
+        candidate_count: 1,
+        returned_count: 1,
+        broad_scan: false,
+        source: "upsertDataView".to_string(),
+        stats: data_trace_stats(backend, 0, 1),
+    };
+    data_result_to_value(result)
+}
+
+fn data_query_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let record_id = argument_text(
+        arguments,
+        &["record_id", "recordId", "id", "node_id", "nodeId"],
+    );
+    if record_id.is_some() {
+        return data_record_payload(tenant, backend, arguments);
+    }
+
+    let collection = data_collection(arguments);
+    let label = argument_text(arguments, &["label"]).or_else(|| {
+        collection
+            .as_deref()
+            .and_then(data_collection_label)
+            .map(str::to_string)
+    });
+    let filters = data_filters(arguments);
+    let broad_scan = arguments
+        .get("broad_scan")
+        .or_else(|| arguments.get("broadScan"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if label.is_none() && filters.is_empty() && !broad_scan {
+        return Err(McpError::invalid_params(
+            "query_data requires id, collection, label, filters, or broad_scan=true",
+        ));
+    }
+
+    let limit = argument_u64(arguments, &["limit"])
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(rustyred_thg_core::DEFAULT_DATA_QUERY_LIMIT)
+        .min(rustyred_thg_core::MAX_DATA_QUERY_LIMIT);
+    let offset = data_cursor_offset(arguments)?;
+    let hydrate_links = data_hydrate_links(arguments);
+    let requires_post_filter = filters
+        .iter()
+        .any(|(_, op, _)| !matches!(op, DataFilterOperator::Equals));
+    let fetch_limit = if requires_post_filter || data_sort_requested(arguments) || offset > 0 {
+        10_000usize
+    } else {
+        offset + limit + 1
+    };
+    let exact_properties = data_exact_properties(&filters);
+    let mut node_query = NodeQuery {
+        label: label.clone(),
+        limit: Some(fetch_limit),
+        ..NodeQuery::default()
+    };
+    for (key, value) in exact_properties {
+        node_query = node_query.with_property(key, value);
+    }
+    if matches!(
+        collection.as_deref(),
+        Some("memory_docs" | "memory" | "memory_doc")
+    ) {
+        node_query = node_query.with_property("tenant_slug", Value::String(tenant.to_string()));
+    }
+
+    let mut degraded = Vec::new();
+    if requires_post_filter {
+        degraded.push(DataDegradedState {
+            code: "post_filter_scan".to_string(),
+            message: "contains/prefix filters are applied over the bounded candidate set until full-text lowering is wired".to_string(),
+        });
+    }
+    let mut nodes = backend.query_nodes(node_query)?;
+    nodes.retain(|node| data_node_matches_filters(node, &filters));
+    let text_query = data_text_query(&filters);
+    if data_sort_requested(arguments) {
+        data_sort_nodes(&mut nodes, arguments);
+    } else {
+        data_rank_nodes(&mut nodes, text_query.as_deref());
+    }
+    let candidate_count = nodes.len();
+    let next_cursor = if candidate_count > offset + limit {
+        Some(format!("offset:{}", offset + limit))
+    } else {
+        None
+    };
+    let records = nodes
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|node| {
+            let mut record =
+                data_record_from_node(backend, &node, hydrate_links, data_link_limit(arguments))?;
+            apply_data_rank_signals(&mut record, &node, text_query.as_deref());
+            Ok::<DataRecord, McpError>(record)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut stats = data_trace_stats(backend, offset, limit);
+    if let Some(text_query) = text_query.as_deref() {
+        stats.insert(
+            "rankers".to_string(),
+            json!(["lexical_contains", "recency"]),
+        );
+        stats.insert("query_text".to_string(), json!(text_query));
+    }
+    let result = DataResult {
+        cursor: next_cursor,
+        trace: DataTrace {
+            tenant: Some(tenant.to_string()),
+            collection: collection.clone(),
+            label,
+            filters_applied: filters
+                .iter()
+                .map(|(field, op, value)| format!("{field}:{op:?}={value}"))
+                .collect(),
+            candidate_count,
+            returned_count: records.len(),
+            broad_scan,
+            source: "query_data".to_string(),
+            stats,
+        },
+        records,
+        degraded,
+    };
+    data_result_to_value(result)
+}
+
+fn data_result_to_value(result: DataResult) -> Result<Value, McpError> {
+    serde_json::to_value(result).map_err(|error| {
+        McpError::internal(format!("failed to serialize Data API result: {error}"))
+    })
+}
+
+fn data_record_from_node(
+    backend: &impl McpGraphBackend,
+    node: &NodeRecord,
+    hydrate_links: bool,
+    link_limit: usize,
+) -> Result<DataRecord, McpError> {
+    let mut record = DataRecord::from_node(node);
+    record.rank_signals.filter_match = true;
+    if hydrate_links {
+        record = record.with_edges(data_links_for_node(backend, &node.id, "both", link_limit)?);
+    }
+    Ok(record)
+}
+
+fn data_links_for_node(
+    backend: &impl McpGraphBackend,
+    node_id: &str,
+    direction: &str,
+    limit: usize,
+) -> Result<Vec<DataLink>, McpError> {
+    let mut links = Vec::new();
+    let wants_out = !matches!(direction, "in" | "incoming");
+    let wants_in = !matches!(direction, "out" | "outgoing");
+    if wants_out {
+        for hit in backend.neighbors(NeighborQuery::out(node_id))? {
+            if links.len() >= limit {
+                break;
+            }
+            if let Some(edge) = backend.get_edge(&hit.edge_id)? {
+                links.push(DataLink::from_edge(&edge, "out"));
+            }
+        }
+    }
+    if wants_in {
+        for hit in backend.neighbors(NeighborQuery::in_(node_id))? {
+            if links.len() >= limit {
+                break;
+            }
+            if let Some(edge) = backend.get_edge(&hit.edge_id)? {
+                links.push(DataLink::from_edge(&edge, "in"));
+            }
+        }
+    }
+    Ok(links)
+}
+
+fn data_collection(arguments: &Value) -> Option<String> {
+    argument_text(arguments, &["collection"])
+        .or_else(|| {
+            arguments
+                .get("collections")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .map(|value| value.replace('-', "_"))
+}
+
+fn data_collection_label(collection: &str) -> Option<&'static str> {
+    match collection {
+        "memory" | "memory_doc" | "memory_docs" => Some("MemoryDocument"),
+        "code_file" | "code_files" => Some("CodeFile"),
+        "code_symbol" | "code_symbols" => Some("CodeSymbol"),
+        "coordination_record" | "coordination_records" => Some("CoordinationRecord"),
+        "job" | "jobs" => Some("Job"),
+        "web_page" | "web_pages" | "rustyweb_pages" => Some("RustyWebPage"),
+        "data_view" | "data_views" | "views" => Some("DataView"),
+        "graph_node" | "graph_nodes" => None,
+        _ => None,
+    }
+}
+
+fn data_filters(arguments: &Value) -> Vec<(String, DataFilterOperator, Value)> {
+    let mut filters = Vec::new();
+    if let Some(properties) = arguments.get("properties").and_then(Value::as_object) {
+        filters.extend(
+            properties
+                .iter()
+                .map(|(key, value)| (key.clone(), DataFilterOperator::Equals, value.clone())),
+        );
+    }
+    for value in argument_array(arguments, &["filters", "where"]).unwrap_or_default() {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let field = object
+            .get("field")
+            .or_else(|| object.get("key"))
+            .or_else(|| object.get("column"))
+            .or_else(|| object.get("property"))
+            .and_then(Value::as_str)
+            .unwrap_or("content")
+            .trim()
+            .to_string();
+        if field.is_empty() {
+            continue;
+        }
+        let raw_op = object
+            .get("op")
+            .or_else(|| object.get("operator"))
+            .or_else(|| object.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("equals")
+            .trim();
+        let op = match raw_op {
+            "contains" | "text" | "text_match" | "match" => DataFilterOperator::Contains,
+            "prefix" | "starts_with" => DataFilterOperator::Prefix,
+            _ => DataFilterOperator::Equals,
+        };
+        let filter_value = object
+            .get("value")
+            .or_else(|| object.get("query"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        filters.push((field, op, filter_value));
+    }
+    filters
+}
+
+fn data_exact_properties(filters: &[(String, DataFilterOperator, Value)]) -> Vec<(String, Value)> {
+    filters
+        .iter()
+        .filter_map(|(field, op, value)| {
+            if matches!(op, DataFilterOperator::Equals) && !matches!(field.as_str(), "id" | "label")
+            {
+                Some((field.clone(), value.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn data_node_matches_filters(
+    node: &NodeRecord,
+    filters: &[(String, DataFilterOperator, Value)],
+) -> bool {
+    filters.iter().all(|(field, op, expected)| {
+        let actual = match field.as_str() {
+            "id" => Some(Value::String(node.id.clone())),
+            "label" | "labels" => Some(Value::Array(
+                node.labels.iter().cloned().map(Value::String).collect(),
+            )),
+            other => node.properties.get(other).cloned(),
+        };
+        match op {
+            DataFilterOperator::Equals => actual.as_ref() == Some(expected),
+            DataFilterOperator::Contains => actual
+                .as_ref()
+                .map(data_value_text)
+                .map(|text| {
+                    text.to_lowercase()
+                        .contains(&data_value_text(expected).to_lowercase())
+                })
+                .unwrap_or(false),
+            DataFilterOperator::Prefix => actual
+                .as_ref()
+                .map(data_value_text)
+                .map(|text| text.starts_with(&data_value_text(expected)))
+                .unwrap_or(false),
+        }
+    })
+}
+
+fn data_value_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn data_cursor_offset(arguments: &Value) -> Result<usize, McpError> {
+    let Some(cursor) = argument_text(arguments, &["cursor"]) else {
+        return Ok(0);
+    };
+    let raw = cursor.strip_prefix("offset:").unwrap_or(cursor.as_str());
+    raw.parse::<usize>()
+        .map_err(|_| McpError::invalid_params("query_data cursor must be offset:<number>"))
+}
+
+fn data_hydrate_links(arguments: &Value) -> bool {
+    arguments
+        .get("hydrate_links")
+        .or_else(|| arguments.get("hydrateLinks"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            arguments
+                .get("hydrate")
+                .and_then(Value::as_object)
+                .and_then(|object| object.get("links").or_else(|| object.get("edges")))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn data_link_limit(arguments: &Value) -> usize {
+    argument_u64(
+        arguments,
+        &["link_limit", "linkLimit", "edge_limit", "edgeLimit"],
+    )
+    .unwrap_or(24)
+    .clamp(1, 100) as usize
+}
+
+fn data_sort_requested(arguments: &Value) -> bool {
+    arguments
+        .get("sort")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+}
+
+fn data_sort_nodes(nodes: &mut [NodeRecord], arguments: &Value) {
+    let sort = argument_array(arguments, &["sort"]).unwrap_or_default();
+    if sort.is_empty() {
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        return;
+    }
+    nodes.sort_by(|left, right| {
+        for item in &sort {
+            let Some(object) = item.as_object() else {
+                continue;
+            };
+            let field = object
+                .get("field")
+                .or_else(|| object.get("key"))
+                .and_then(Value::as_str)
+                .unwrap_or("id");
+            let desc = object
+                .get("direction")
+                .or_else(|| object.get("dir"))
+                .and_then(Value::as_str)
+                .map(|value| matches!(value, "desc" | "DESC"))
+                .unwrap_or(false);
+            let ordering = data_sort_value(left, field).cmp(&data_sort_value(right, field));
+            if !ordering.is_eq() {
+                return if desc { ordering.reverse() } else { ordering };
+            }
+        }
+        left.id.cmp(&right.id)
+    });
+}
+
+fn data_sort_value(node: &NodeRecord, field: &str) -> String {
+    match field {
+        "id" => node.id.clone(),
+        "label" | "labels" => node.labels.join(","),
+        other => node
+            .properties
+            .get(other)
+            .map(data_value_text)
+            .unwrap_or_default(),
+    }
+}
+
+fn data_rank_nodes(nodes: &mut [NodeRecord], text_query: Option<&str>) {
+    nodes.sort_by(|left, right| {
+        let left_score = data_node_rank_score(left, text_query);
+        let right_score = data_node_rank_score(right, text_query);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                data_sort_value(right, "updated_at_ms").cmp(&data_sort_value(left, "updated_at_ms"))
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn apply_data_rank_signals(record: &mut DataRecord, node: &NodeRecord, text_query: Option<&str>) {
+    record.rank_signals.exact_match = text_query
+        .map(|query| data_node_exact_text_match(node, query))
+        .unwrap_or(false);
+    record.rank_signals.text_score = text_query.map(|query| data_node_text_score(node, query));
+    record.rank_signals.recency_score = data_node_recency_score(node);
+    let final_score = data_node_rank_score(node, text_query);
+    if final_score > 0.0 {
+        record.score = Some(final_score);
+        record.rank_signals.final_score = Some(final_score);
+    }
+    if text_query.is_some() {
+        record
+            .rank_signals
+            .notes
+            .push("ranked_by_data_api_lexical_recency".to_string());
+    }
+}
+
+fn data_node_rank_score(node: &NodeRecord, text_query: Option<&str>) -> f64 {
+    let text = text_query
+        .map(|query| data_node_text_score(node, query))
+        .unwrap_or(0.0);
+    let recency = data_node_recency_score(node).unwrap_or(0.0);
+    text + (recency * 0.05)
+}
+
+fn data_node_text_score(node: &NodeRecord, query: &str) -> f64 {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return 0.0;
+    }
+    let mut score = 0.0;
+    for (field, weight) in [
+        ("title", 4.0),
+        ("summary", 2.0),
+        ("gist", 2.0),
+        ("content", 1.0),
+        ("path", 1.0),
+        ("source", 0.5),
+    ] {
+        let Some(value) = node.properties.get(field) else {
+            continue;
+        };
+        let text = data_value_text(value).to_lowercase();
+        if text == query {
+            score += weight * 2.0;
+        } else if text.contains(&query) {
+            score += weight;
+        }
+    }
+    score
+}
+
+fn data_node_exact_text_match(node: &NodeRecord, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    ["title", "summary", "gist", "content", "path"]
+        .iter()
+        .filter_map(|field| node.properties.get(*field))
+        .map(data_value_text)
+        .any(|text| text.to_lowercase() == query)
+}
+
+fn data_node_recency_score(node: &NodeRecord) -> Option<f64> {
+    let updated = node
+        .properties
+        .get("updated_at_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| node.properties.get("updatedAtMs").and_then(Value::as_i64))?;
+    let now = now_unix_ms().max(updated);
+    let age_ms = (now - updated).max(0) as f64;
+    let day_ms = 86_400_000.0;
+    Some(1.0 / (1.0 + (age_ms / day_ms)))
+}
+
+fn data_text_query(filters: &[(String, DataFilterOperator, Value)]) -> Option<String> {
+    filters
+        .iter()
+        .find(|(_, op, _)| matches!(op, DataFilterOperator::Contains))
+        .map(|(_, _, value)| data_value_text(value))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn data_trace_stats(
+    backend: &impl McpGraphBackend,
+    offset: usize,
+    limit: usize,
+) -> BTreeMap<String, Value> {
+    let mut stats = BTreeMap::new();
+    stats.insert("offset".to_string(), json!(offset));
+    stats.insert("limit".to_string(), json!(limit));
+    let index_health = match backend.vector_designations() {
+        Ok(designations) => json!({
+            "vector": { "status": "available", "designations": designations.len() },
+            "fulltext": { "status": "fallback_post_filter" },
+            "spatial": { "status": "route_available" }
+        }),
+        Err(error) => json!({
+            "vector": { "status": "unavailable", "error": error.message },
+            "fulltext": { "status": "fallback_post_filter" },
+            "spatial": { "status": "unknown" }
+        }),
+    };
+    stats.insert("index_health".to_string(), index_health);
+    stats
+}
+
+fn data_view_arg_id(arguments: &Value) -> Result<String, McpError> {
+    argument_text(arguments, &["view_id", "viewId", "id", "name"])
+        .map(|value| value.replace(['/', ' '], "_"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| McpError::invalid_params("Data View requires id/view_id/name"))
+}
+
+fn data_view_node_id(tenant: &str, view_id: &str) -> String {
+    format!(
+        "data_view:{}:{}",
+        tenant,
+        stable_value_hash(&json!([tenant, view_id]))
+    )
 }
 
 fn epistemic_neighbors_payload(
@@ -8141,6 +9006,399 @@ fn reverse_engineer_feature_payload(
     Ok(reverse_engineer_feature_response(tenant, operation, result))
 }
 
+fn reconstruct_mode(arguments: &Value) -> Result<String, McpError> {
+    let raw = argument_text(arguments, &["mode", "pipeline", "kind"])
+        .unwrap_or_else(|| "compose".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.'], "_");
+    match raw.as_str() {
+        "compose" | "binary" | "datawave" | "source_to_binary" | "binary_from_source" | "slice"
+        | "behavior_ir" | "target_plan" | "emit" | "validate" | "port" => Ok(raw),
+        other => Err(McpError::invalid_params(format!(
+            "unsupported reconstruct mode `{other}`"
+        ))),
+    }
+}
+
+fn reconstruct_mode_writes(mode: &str, arguments: &Value) -> bool {
+    match mode {
+        "datawave" => datawave_ingest_operation(arguments)
+            .map(|operation| datawave_ingest_writes_graph(&operation))
+            .unwrap_or(true),
+        "binary" | "source_to_binary" | "binary_from_source" => {
+            reconstruct_binary_operation(arguments)
+                .map(|operation| reconstruct_binary_writes_graph(&operation))
+                .unwrap_or(true)
+        }
+        _ => true,
+    }
+}
+
+fn reconstruct_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    mode: &str,
+) -> Result<Value, McpError> {
+    let mut stage_receipts = Vec::new();
+    let (normalized_mode, result) = match mode {
+        "compose" => {
+            stage_receipts.push(json!({"stage": "reverse_engineer_compose", "status": "ran"}));
+            (
+                "compose",
+                reverse_engineer_compose_payload(tenant, backend, arguments)?,
+            )
+        }
+        "slice" | "behavior_ir" | "target_plan" | "emit" | "validate" | "port" => {
+            stage_receipts.push(json!({"stage": "reverse_engineer_compose", "status": "ran"}));
+            stage_receipts.push(json!({"stage": mode, "status": "ran"}));
+            (
+                mode,
+                reverse_engineer_feature_payload(tenant, backend, arguments, mode)?,
+            )
+        }
+        "datawave" => {
+            let operation = datawave_ingest_operation(arguments)?;
+            stage_receipts
+                .push(json!({"stage": "datawave_ingest", "operation": operation, "status": "ran"}));
+            (
+                "datawave",
+                datawave_ingest_payload(tenant, backend, arguments, &operation)?,
+            )
+        }
+        "binary" => {
+            let operation = reconstruct_binary_operation(arguments)?;
+            stage_receipts.push(
+                json!({"stage": "reconstruct_binary", "operation": operation, "status": "ran"}),
+            );
+            (
+                "binary",
+                reconstruct_binary_payload(tenant, backend, arguments, &operation)?,
+            )
+        }
+        "source_to_binary" | "binary_from_source" => {
+            let operation =
+                reconstruct_binary_operation(arguments).unwrap_or_else(|_| "analyze".to_string());
+            stage_receipts.push(json!({
+                "stage": "source_to_binary",
+                "status": "planned",
+                "build_command": arguments.get("build_command").or_else(|| arguments.get("buildCommand")).cloned().unwrap_or(Value::Null),
+                "artifact_path": arguments.get("artifact_path").or_else(|| arguments.get("binary_path")).cloned().unwrap_or(Value::Null)
+            }));
+            stage_receipts.push(
+                json!({"stage": "reconstruct_binary", "operation": operation, "status": "ran"}),
+            );
+            (
+                "source_to_binary",
+                reconstruct_binary_payload(tenant, backend, arguments, &operation)?,
+            )
+        }
+        _ => unreachable!("mode validated by reconstruct_mode"),
+    };
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "reconstruct",
+        "mode": normalized_mode,
+        "stage_receipts": stage_receipts,
+        "result": result
+    }))
+}
+
+fn understand_code_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let search = code_search_payload(tenant, backend, arguments, "search")?;
+    let context = code_search_payload(tenant, backend, arguments, "context")?;
+    let explain = code_search_payload(tenant, backend, arguments, "explain")?;
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "understand_code",
+        "feature_map": search,
+        "component_map": context,
+        "ownership_map": data_api_payload(tenant, backend, &json!({
+            "collection": "code_files",
+            "limit": argument_u64(arguments, &["limit"]).unwrap_or(20),
+            "broad_scan": true
+        }), "query").unwrap_or_else(|error| json!({"degraded": [{"code": "ownership_map_unavailable", "message": error.message}]})),
+        "call_graph_summary": explain,
+        "risk_notes": [],
+        "evidence": {
+            "records": data_api_payload(tenant, backend, &json!({
+                "collection": "code_symbols",
+                "query": argument_text(arguments, &["query"]).unwrap_or_default(),
+                "filters": [],
+                "limit": argument_u64(arguments, &["limit"]).unwrap_or(20),
+                "broad_scan": true
+            }), "query").unwrap_or_else(|error| json!({"degraded": [{"code": "evidence_unavailable", "message": error.message}]}))
+        }
+    }))
+}
+
+fn impact_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let seed = argument_text(
+        arguments,
+        &["seed", "record_id", "recordId", "node_id", "nodeId"],
+    );
+    let symbol_name = argument_text(arguments, &["symbol_name", "symbolName", "symbol"]);
+    let instant = if seed.is_some() || symbol_name.is_some() {
+        instant_kg_payload(tenant, backend, arguments, "impact", "impact")?
+    } else {
+        json!({
+            "degraded": [{
+                "code": "impact_seed_missing",
+                "message": "impact needs seed/record_id/node_id or symbol_name to run KG impact traversal"
+            }]
+        })
+    };
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "impact",
+        "seed": seed,
+        "symbol_name": symbol_name,
+        "blast_radius": instant,
+        "evidence": data_api_payload_readonly(tenant, backend, arguments, "query")
+    }))
+}
+
+fn oracle_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    read_only: bool,
+) -> Result<Value, McpError> {
+    let claim = argument_text(arguments, &["claim", "query", "text"]).unwrap_or_default();
+    let verify = backend.verify().map_err(graph_store_mcp_error)?;
+    let learn_pattern = arguments
+        .get("learn_pattern")
+        .or_else(|| arguments.get("learnPattern"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut learned = Value::Null;
+    if learn_pattern {
+        if read_only {
+            return Err(McpError::invalid_params(
+                "oracle learn_pattern requires write-enabled MCP mode",
+            ));
+        }
+        let node_id = format!(
+            "learned_pattern:{}",
+            stable_value_hash(&json!([tenant, claim]))
+        );
+        let node = NodeRecord::new(
+            node_id,
+            ["LearnedPattern", "OracleReceipt"],
+            json!({
+                "tenant_slug": tenant,
+                "claim": claim,
+                "outcome": arguments.get("outcome").cloned().unwrap_or_else(|| json!("observed")),
+                "updated_at_ms": now_unix_ms()
+            }),
+        );
+        backend.upsert_node(node.clone())?;
+        learned = serde_json::to_value(DataRecord::from_node(&node)).unwrap_or(Value::Null);
+    }
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "oracle",
+        "claim": claim,
+        "verdict": if verify.ok { "supported" } else { "needs_review" },
+        "graph_verify": verify,
+        "evidence": data_api_payload(tenant, backend, arguments, "query").unwrap_or_else(|error| json!({
+            "degraded": [{ "code": "oracle_evidence_unavailable", "message": error.message }]
+        })),
+        "learned_pattern": learned
+    }))
+}
+
+fn observe_web_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    read_only: bool,
+) -> Result<Value, McpError> {
+    let ingest = arguments
+        .get("ingest")
+        .or_else(|| arguments.get("write"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if ingest && read_only {
+        return Err(McpError::invalid_params(
+            "observe_web ingest=true requires write-enabled MCP mode",
+        ));
+    }
+    let mut ingested = Value::Null;
+    if ingest {
+        let url = argument_text(arguments, &["url", "source_url", "sourceUrl"])
+            .ok_or_else(|| McpError::invalid_params("observe_web ingest=true requires url"))?;
+        let content = argument_text(arguments, &["content", "text", "body"]).unwrap_or_default();
+        let node_id = format!(
+            "web_page:{}",
+            stable_value_hash(&json!([tenant, url, content]))
+        );
+        let node = NodeRecord::new(
+            node_id,
+            ["RustyWebPage"],
+            json!({
+                "tenant_slug": tenant,
+                "url": url,
+                "source": url,
+                "title": argument_text(arguments, &["title"]).unwrap_or_default(),
+                "content": content,
+                "trust_tier": argument_text(arguments, &["trust_tier", "trustTier"]).unwrap_or_else(|| "web_observed".to_string()),
+                "fetched_at_ms": now_unix_ms(),
+                "updated_at_ms": now_unix_ms()
+            }),
+        );
+        backend.upsert_node(node.clone())?;
+        ingested = serde_json::to_value(DataRecord::from_node(&node)).unwrap_or(Value::Null);
+    }
+    let query = web_query_payload(tenant, backend, arguments).unwrap_or_else(|error| {
+        json!({
+            "degraded": [{
+                "code": "web_query_unavailable",
+                "message": error.message
+            }]
+        })
+    });
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "observe_web",
+        "query": query,
+        "records": data_api_payload(tenant, backend, &json!({
+            "collection": "web_pages",
+            "limit": argument_u64(arguments, &["limit"]).unwrap_or(20),
+            "broad_scan": true
+        }), "query").unwrap_or_else(|error| json!({
+            "degraded": [{ "code": "web_records_unavailable", "message": error.message }]
+        })),
+        "ingest": ingest,
+        "ingested": ingested
+    }))
+}
+
+fn turn_start_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut discovery_args = arguments.clone();
+    if !discovery_args.is_object() {
+        discovery_args = json!({});
+    }
+    let object = discovery_args
+        .as_object_mut()
+        .expect("turn_start args object");
+    object
+        .entry("actor".to_string())
+        .or_insert_with(|| json!("theorem-harness-mcp"));
+    object.entry("task".to_string()).or_insert_with(|| {
+        json!({
+            "repo": argument_text(arguments, &["repo"]).unwrap_or_else(|| "Theorem".to_string()),
+            "workstream": argument_text(arguments, &["workstream"]).unwrap_or_else(|| "data_api".to_string())
+        })
+    });
+    let coordination = coordination_v2_payload(tenant, backend, "turn_start_discovery", &discovery_args)
+        .unwrap_or_else(|error| json!({"degraded": [{"code": "coordination_unavailable", "message": error.message}]}));
+    let memory_query = argument_text(arguments, &["query", "task", "workstream"])
+        .unwrap_or_else(|| "current task".to_string());
+    let memory = data_retrieve_payload(
+        tenant,
+        backend,
+        &json!({ "query": memory_query, "limit": argument_u64(arguments, &["limit"]).unwrap_or(10) }),
+    )
+    .unwrap_or_else(|error| json!({"degraded": [{"code": "memory_context_unavailable", "message": error.message}]}));
+    let open_checklist = data_api_payload(
+        tenant,
+        backend,
+        &json!({
+            "label": "ChecklistItem",
+            "filters": [{ "field": "status", "op": "contains", "value": "open" }],
+            "limit": argument_u64(arguments, &["limit"]).unwrap_or(10)
+        }),
+        "query",
+    )
+    .unwrap_or_else(|error| json!({"degraded": [{"code": "checklist_context_unavailable", "message": error.message}]}));
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "turn_start",
+        "coordination": coordination,
+        "memory": memory,
+        "open_checklist": open_checklist,
+        "trace": {
+            "source": "turn_start",
+            "work_queue_mode": true,
+            "generated_at_ms": now_unix_ms()
+        }
+    }))
+}
+
+fn evidence_bundle_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut records = Vec::new();
+    let mut degraded = Vec::new();
+    for id in argument_string_list(arguments, &["record_ids", "recordIds", "ids"]) {
+        match data_record_payload(tenant, backend, &json!({ "id": id, "hydrate_links": true })) {
+            Ok(value) => records.push(value),
+            Err(error) => {
+                degraded.push(json!({"code": "record_unavailable", "message": error.message}))
+            }
+        }
+    }
+    for query in argument_array(arguments, &["queries", "query_refs"]).unwrap_or_default() {
+        match data_query_payload(tenant, backend, &query) {
+            Ok(value) => records.push(value),
+            Err(error) => {
+                degraded.push(json!({"code": "query_unavailable", "message": error.message}))
+            }
+        }
+    }
+    Ok(json!({
+        "tenant": tenant,
+        "tool": "evidence_bundle",
+        "records": records,
+        "snippets": [],
+        "provenance": [],
+        "validation_receipts": [],
+        "trace": {
+            "source": "evidence_bundle",
+            "record_packets": records.len(),
+            "generated_at_ms": now_unix_ms()
+        },
+        "degraded": degraded
+    }))
+}
+
+fn data_api_payload_readonly(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Value {
+    match operation {
+        "query" => data_query_payload(tenant, backend, arguments),
+        "retrieve" => data_retrieve_payload(tenant, backend, arguments),
+        "record" => data_record_payload(tenant, backend, arguments),
+        "links" => data_links_payload(tenant, backend, arguments),
+        "schema" => data_schema_payload(tenant, backend),
+        _ => Err(McpError::invalid_params(format!(
+            "unsupported read-only Data API operation {operation}"
+        ))),
+    }
+    .unwrap_or_else(
+        |error| json!({"degraded": [{"code": "data_api_unavailable", "message": error.message}]}),
+    )
+}
+
 fn datawave_ingest_operation(arguments: &Value) -> Result<String, McpError> {
     let raw = arguments
         .get("operation")
@@ -8229,6 +9487,9 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
     match raw.as_str() {
         "ingest" | "reindex" | "search" | "context" | "recognize" | "explore" | "explain" => {
             Ok(raw)
+        }
+        "facts" | "fact_extraction" | "extract_facts" | "feature_facts" => {
+            Ok("context".to_string())
         }
         // D1: ingest/reindex are job submissions that return a job_id; this
         // read-only operation polls a submitted job's status and event log.
@@ -13099,6 +14360,8 @@ const GRAPHQL_COVERED_FLAT_TOOLS: &[&str] = &[
     "rustyred_thg_symbolic_datalog_derive",
     "rustyred_thg_symbolic_probabilistic_source_reliability",
     "rustyred_thg_symbolic_probabilistic_expected_value",
+    // data records membrane
+    "query_data",
     // epistemic shadow graph
     "rustyred_thg_epistemic_neighbors",
     "epistemic_dirty_frontier",
@@ -13338,6 +14601,93 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "label": { "type": "string" },
                     "properties": { "type": "object" },
                     "budget": { "type": "object" }
+                }
+            }),
+        ),
+        tool(
+            "query_data",
+            "Query tenant-scoped RustyRed records through the Data API envelope. Supports record id lookups, collection/label scans, exact/contains/prefix filters, cursor paging, link hydration, provenance, rank_signals, and trace receipts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "collection": { "type": "string", "description": "Known collections include memory_docs, code_files, code_symbols, coordination_records, jobs, web_pages, and graph_nodes." },
+                    "collections": { "type": "array", "items": { "type": "string" } },
+                    "label": { "type": "string", "description": "Raw graph label when collection is not enough." },
+                    "id": { "type": "string" },
+                    "record_id": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "properties": { "type": "object", "description": "Exact property filters." },
+                    "filters": { "type": "array", "items": { "type": "object" } },
+                    "where": { "type": "array", "items": { "type": "object" } },
+                    "sort": { "type": "array", "items": { "type": "object" } },
+                    "limit": { "type": "integer", "default": 20 },
+                    "cursor": { "type": "string" },
+                    "hydrate": { "type": "object" },
+                    "hydrate_links": { "type": "boolean", "default": false },
+                    "broad_scan": { "type": "boolean", "default": false },
+                    "trace": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        tool(
+            "retrieve_memory",
+            "Memory retrieval built on query_data: deterministic tenant/repo/path/room/tag/status narrowing, then ranked memory records inside the candidate set.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "query": { "type": "string" },
+                    "project": { "type": "string" },
+                    "project_slug": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "repo_id": { "type": "string" },
+                    "path": { "type": "string" },
+                    "room": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "source": { "type": "string" },
+                    "status": { "type": "string" },
+                    "validity": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 },
+                    "cursor": { "type": "string" },
+                    "hydrate_links": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        tool(
+            "turn_start",
+            "Return a work-queue context packet: coordination discovery, relevant memory records, open checklist records, and degraded retrieval notes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "workstream": { "type": "string" },
+                    "task": { "type": "object" },
+                    "query": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "worktree": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }),
+        ),
+        tool(
+            "evidence_bundle",
+            "Bundle record ids and Data API query refs into a compact cited handoff packet with records, links, trace, provenance, and degraded notes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "record_ids": { "type": "array", "items": { "type": "string" } },
+                    "ids": { "type": "array", "items": { "type": "string" } },
+                    "queries": { "type": "array", "items": { "type": "object" } },
+                    "query_refs": { "type": "array", "items": { "type": "object" } }
                 }
             }),
         ),
@@ -14042,23 +15392,28 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool(
             "compute_code",
-            "Native CodeCrawler read path for graph-structural code discovery: search, context, explain, recognize, and explore.",
+            "Combined CodeCrawler tool for code ingest and code fact computation: ingest, reindex, search, context, explain, recognize, explore, and fact extraction.",
             json!({
                 "type": "object",
                 "properties": {
                     "tenant_slug": { "type": "string" },
                     "operation": {
                         "type": "string",
-                        "enum": ["search", "context", "recognize", "explore", "explain", "list_repos", "kg_status", "context_pack", "ingest_status"],
+                        "enum": ["ingest", "reindex", "search", "context", "recognize", "explore", "explain", "list_repos", "kg_status", "context_pack", "ingest_status", "session_reingest", "record_use_receipt"],
                         "default": "search"
                     },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
                     "repo": { "type": "string" },
+                    "repo_url": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "files": { "type": "array", "items": { "type": "object" } },
                     "path_prefix": { "type": "string" },
                     "kinds": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
-                    "limits": { "type": "object" }
+                    "limits": { "type": "object" },
+                    "confirmed": { "type": "boolean", "default": true }
                 }
             }),
         ),
@@ -14216,6 +15571,105 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                         },
                         "description": "AND-intersected value+field predicates for operation=intersect."
                     }
+                }
+            }),
+        ),
+        tool_write(
+            "reconstruct",
+            "Compound reconstruction tool over reverse_engineer_compose, reconstruct_binary, and datawave_ingest. Modes include compose, binary, datawave, source_to_binary, slice, behavior_ir, target_plan, emit, validate, and port.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant_slug": { "type": "string" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["compose", "binary", "datawave", "source_to_binary", "slice", "behavior_ir", "target_plan", "emit", "validate", "port"],
+                        "default": "compose"
+                    },
+                    "source": { "type": "object" },
+                    "repo": { "type": "string" },
+                    "repo_url": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "binary_path": { "type": "string" },
+                    "artifact_path": { "type": "string" },
+                    "artifact_name": { "type": "string" },
+                    "bytes_hex": { "type": "string" },
+                    "build_command": { "type": "string" },
+                    "operation": { "type": "string" },
+                    "feature": { "type": "string" },
+                    "target": { "type": "object" },
+                    "record": {},
+                    "records": { "type": "array" },
+                    "helper": { "type": "object" },
+                    "confirmed": { "type": "boolean", "default": true },
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        tool(
+            "understand_code",
+            "Explain a repo/path/query using code graph facts and Data API evidence: feature map, component map, ownership map, call graph summary, risks, and records.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "query": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "path_prefix": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }),
+        ),
+        tool(
+            "impact",
+            "Rank blast radius across KG/code/docs/jobs/obligations from a seed record, symbol, route, file, or claim id, with Data API evidence.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "seed": { "type": "string" },
+                    "record_id": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "symbol_name": { "type": "string" },
+                    "direction": { "type": "string" },
+                    "max_depth": { "type": "integer", "default": 2 },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }),
+        ),
+        tool(
+            "oracle",
+            "Validate a claim against graph verification, records, and evidence. Can write a learn_pattern receipt only when write mode is explicit and MCP is write-enabled.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "claim": { "type": "string" },
+                    "query": { "type": "string" },
+                    "record_id": { "type": "string" },
+                    "filters": { "type": "array", "items": { "type": "object" } },
+                    "learn_pattern": { "type": "boolean", "default": false },
+                    "outcome": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }),
+        ),
+        tool(
+            "observe_web",
+            "Read URL/API/docs evidence from RustyWeb/Datawave records and expose the results through the Data API envelope.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "url": { "type": "string" },
+                    "query": { "type": "string" },
+                    "ingest": { "type": "boolean", "default": false },
+                    "limit": { "type": "integer", "default": 20 }
                 }
             }),
         ),
@@ -19009,9 +20463,14 @@ mod tests {
         assert!(has_tool(tools, "relate"));
         assert!(has_tool(tools, "self_recall_archive"));
         assert!(has_tool(tools, "observe"));
+        assert!(has_tool(tools, "query_data"));
+        assert!(has_tool(tools, "retrieve_memory"));
+        assert!(has_tool(tools, "turn_start"));
+        assert!(has_tool(tools, "evidence_bundle"));
         assert!(!has_tool(tools, "code_search"));
         assert!(has_tool(tools, "compute_code"));
         assert!(has_tool(tools, "code_ingest"));
+        assert!(has_tool(tools, "understand_code"));
         assert!(has_tool(tools, "code_compile_spec"));
         assert!(has_tool(tools, "code_extract_features"));
         assert!(has_tool(tools, "code_implementation_obligations"));
@@ -19024,8 +20483,12 @@ mod tests {
         assert!(has_tool(tools, "reverse_engineer_emit"));
         assert!(has_tool(tools, "reverse_engineer_validate"));
         assert!(has_tool(tools, "reverse_engineer_port"));
+        assert!(has_tool(tools, "reconstruct"));
         assert!(has_tool(tools, "reconstruct_binary"));
         assert!(has_tool(tools, "datawave_ingest"));
+        assert!(has_tool(tools, "impact"));
+        assert!(has_tool(tools, "oracle"));
+        assert!(has_tool(tools, "observe_web"));
         assert!(has_tool(tools, "harness_prepare"));
         assert!(has_tool(tools, "design_extract"));
         assert!(has_tool(tools, "design_audit"));
@@ -19036,15 +20499,13 @@ mod tests {
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo"]["type"],
             "string"
         );
-        assert!(
-            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
-                .get("confirmed")
-                .is_none()
+        assert_eq!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["confirmed"]["type"],
+            "boolean"
         );
-        assert!(
-            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
-                .get("repo_url")
-                .is_none()
+        assert_eq!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo_url"]["type"],
+            "string"
         );
         assert!(
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
@@ -23042,6 +24503,7 @@ mod tests {
             "rustyred_thg_graph_neighbors",
             "rustyred_thg_algorithm_ppr",
             "compute_code",
+            "query_data",
             "job_list",
             "harness_kg_search",
         ] {
@@ -23781,6 +25243,355 @@ mod tests {
             response["result"]["structuredContent"]["stats"]["truncated"],
             true
         );
+    }
+
+    #[test]
+    fn query_data_filters_records_and_hydrates_links() {
+        let (provider, config) = fixture();
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "query_data"));
+
+        let response = call_tool_json(
+            &provider,
+            &config,
+            "query_data",
+            json!({
+                "tenant": "smoke",
+                "label": "Person",
+                "properties": { "name": "Grace" },
+                "hydrate_links": true,
+                "limit": 10
+            }),
+        );
+
+        assert_eq!(response["trace"]["source"], "query_data");
+        assert_eq!(response["records"].as_array().unwrap().len(), 1);
+        let record = &response["records"][0];
+        assert_eq!(record["id"], "node:b");
+        assert_eq!(record["fields"]["name"], "Grace");
+        assert!(record["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|label| label == "Person"));
+        assert_eq!(record["rank_signals"]["filter_match"], true);
+        assert!(record["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["id"] == "edge:ab" && edge["direction"] == "in"));
+
+        let page = call_tool_json(
+            &provider,
+            &config,
+            "query_data",
+            json!({ "tenant": "smoke", "label": "Person", "limit": 2 }),
+        );
+        assert_eq!(page["records"].as_array().unwrap().len(), 2);
+        assert_eq!(page["cursor"], "offset:2");
+    }
+
+    #[test]
+    fn graphql_data_domain_exposes_query_data_envelope() {
+        let (provider, mut config) = fixture();
+        config.tool_result_budget_bytes = 0;
+
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "dataSchema",
+            "dataRecords",
+            "dataRecord",
+            "dataLinks",
+            "dataQuery",
+            "dataRetrieve",
+            "dataViews",
+            "dataView",
+            "upsertDataView",
+        ] {
+            assert!(
+                sdl.contains(fragment),
+                "SDL missing data-domain {fragment}:\n{sdl}"
+            );
+        }
+
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ dataRecords(label:\"Person\", limit:2, hydrateLinks:true) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql);
+        let records = gql["data"]["dataRecords"]["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record["id"] == "node:a"));
+        assert_eq!(gql["data"]["dataRecords"]["trace"]["source"], "query_data");
+
+        let one = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ dataRecord(id:\"node:b\", hydrateLinks:true) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&one);
+        assert_eq!(one["data"]["dataRecord"]["records"][0]["id"], "node:b");
+        assert!(one["data"]["dataRecord"]["records"][0]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["id"] == "edge:ab"));
+    }
+
+    #[test]
+    fn retrieve_memory_narrows_candidates_and_scores_records() {
+        let (provider, config) = fixture();
+        {
+            let mut store = provider.0.borrow_mut();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:router",
+                    ["MemoryDocument"],
+                    json!({
+                        "tenant_slug": "smoke",
+                        "title": "Router data API decision",
+                        "content": "Use query_data for deterministic router memory retrieval.",
+                        "repo": "Theorem",
+                        "path": "rustyred-thg-server/src/router.rs",
+                        "tags": ["data-api", "router"],
+                        "status": "active",
+                        "updated_at_ms": 10_000
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:other",
+                    ["MemoryDocument"],
+                    json!({
+                        "tenant_slug": "smoke",
+                        "title": "Other note",
+                        "content": "Different subsystem.",
+                        "repo": "Other",
+                        "tags": ["misc"],
+                        "status": "active",
+                        "updated_at_ms": 1
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let response = call_tool_json(
+            &provider,
+            &config,
+            "retrieve_memory",
+            json!({
+                "tenant": "smoke",
+                "query": "query_data",
+                "repo": "Theorem",
+                "tags": ["router"],
+                "status": "active",
+                "limit": 5
+            }),
+        );
+
+        assert_eq!(response["trace"]["source"], "query_data");
+        assert_eq!(response["records"].as_array().unwrap().len(), 1);
+        let record = &response["records"][0];
+        assert_eq!(record["id"], "mem:router");
+        assert!(record["score"].as_f64().unwrap_or_default() > 0.0);
+        assert!(
+            record["rank_signals"]["text_score"]
+                .as_f64()
+                .unwrap_or_default()
+                > 0.0
+        );
+        assert!(response["trace"]["stats"]["index_health"].is_object());
+    }
+
+    #[test]
+    fn graphql_data_views_persist_and_rerun_saved_queries() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let saved = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($q:JSON!){ upsertDataView(id:\"people\", title:\"People\", query:$q) }",
+            json!({ "q": { "label": "Person", "limit": 1 } }),
+        );
+        assert_no_graphql_errors(&saved);
+        assert_eq!(
+            saved["data"]["upsertDataView"]["records"][0]["fields"]["view_id"],
+            "people"
+        );
+        assert_eq!(
+            saved["data"]["upsertDataView"]["records"][0]["type"],
+            "data_view"
+        );
+
+        let listed = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ dataViews(limit:10) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&listed);
+        assert_eq!(
+            listed["data"]["dataViews"]["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let rerun = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ dataView(id:\"people\", run:true) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&rerun);
+        assert_eq!(
+            rerun["data"]["dataView"]["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            rerun["data"]["dataView"]["view"]["fields"]["view_id"],
+            "people"
+        );
+    }
+
+    #[test]
+    fn compound_tools_are_advertised_and_reconstruct_routes_inner_stage() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        for expected in [
+            "retrieve_memory",
+            "turn_start",
+            "evidence_bundle",
+            "reconstruct",
+            "understand_code",
+            "impact",
+            "oracle",
+            "observe_web",
+        ] {
+            assert!(
+                has_tool(tools, expected),
+                "missing compound tool {expected}"
+            );
+        }
+        let compute_ops = tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
+            ["operation"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(compute_ops.iter().any(|value| value == "ingest"));
+
+        let reconstructed = call_tool_json(
+            &provider,
+            &config,
+            "reconstruct",
+            json!({
+                "tenant": "smoke",
+                "mode": "binary",
+                "operation": "instruction_get",
+                "instruction_id": "fixture"
+            }),
+        );
+        assert_eq!(reconstructed["tool"], "reconstruct");
+        assert_eq!(reconstructed["mode"], "binary");
+        assert_eq!(
+            reconstructed["stage_receipts"][0]["stage"],
+            "reconstruct_binary"
+        );
+
+        let observed = call_tool_json(
+            &provider,
+            &config,
+            "observe_web",
+            json!({
+                "tenant": "smoke",
+                "ingest": true,
+                "url": "https://example.test/docs",
+                "title": "Example docs",
+                "content": "Data API web evidence"
+            }),
+        );
+        assert_eq!(observed["ingest"], true);
+        assert_eq!(observed["ingested"]["type"], "rusty_web_page");
+        assert_eq!(
+            observed["ingested"]["fields"]["url"],
+            "https://example.test/docs"
+        );
+
+        let turn_start = call_tool_json(
+            &provider,
+            &config,
+            "turn_start",
+            json!({ "tenant": "smoke", "actor": "codex", "repo": "Theorem", "workstream": "data_api" }),
+        );
+        assert_eq!(turn_start["trace"]["source"], "turn_start");
+
+        let bundle = call_tool_json(
+            &provider,
+            &config,
+            "evidence_bundle",
+            json!({ "tenant": "smoke", "record_ids": ["node:a"] }),
+        );
+        assert_eq!(bundle["records"].as_array().unwrap().len(), 1);
+
+        let understood = call_tool_json(
+            &provider,
+            &config,
+            "understand_code",
+            json!({ "tenant": "smoke", "query": "Ada", "limit": 2 }),
+        );
+        assert_eq!(understood["tool"], "understand_code");
+
+        let impact = call_tool_json(
+            &provider,
+            &config,
+            "impact",
+            json!({ "tenant": "smoke", "seed": "node:a", "max_depth": 1 }),
+        );
+        assert_eq!(impact["tool"], "impact");
+
+        let oracle = call_tool_json(
+            &provider,
+            &config,
+            "oracle",
+            json!({ "tenant": "smoke", "claim": "graph is queryable", "broad_scan": true }),
+        );
+        assert_eq!(oracle["tool"], "oracle");
     }
 
     #[test]

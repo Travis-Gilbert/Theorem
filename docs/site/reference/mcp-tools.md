@@ -25,6 +25,37 @@ Durable, typed memory that survives across sessions.
 | `forget` | Soft-delete a memory with an audit reason. |
 | `handoff` | Create a cross-agent handoff memory. |
 
+## Data API
+
+Records/query membrane over RustyRed GraphStore entities. Use this when you want
+PostgREST/NocoDB-style ergonomics instead of low-level graph primitives.
+
+| Tool | What it does |
+|---|---|
+| `query_data` | Query records by id, collection, label, exact/contains/prefix filters, cursor, and optional link hydration. Returns a consistent envelope with `records`, `fields`, `score`, `edges`, `provenance`, `rank_signals`, `cursor`, `trace`, and `degraded`. |
+| `retrieve_memory` | Memory retrieval on top of `query_data`: deterministic tenant, repo, path, room, tag, source, status, and validity narrowing, then lexical/recency ranking inside the candidate set. |
+| `turn_start` | Work-queue context packet for a head at turn start: coordination discovery, relevant memory records, open checklist records, and degraded notes. |
+| `evidence_bundle` | Bundle record ids and query refs into a compact cited handoff packet with records, links, trace, and provenance. |
+
+GraphQL carries the same read-first surface through `dataSchema`, `dataRecords`,
+`dataRecord`, `dataLinks`, `dataQuery`, `dataRetrieve`, `dataViews`, and
+`dataView`. `upsertDataView` persists a tenant-scoped `DataView` graph record
+whose saved query can be fetched and re-run.
+
+HTTP exposes the same membrane at:
+
+| Route | What it does |
+|---|---|
+| `GET /v1/tenants/:tenant_id/data/schema` | Collection and envelope schema. |
+| `GET /v1/tenants/:tenant_id/data/memory-docs` | Memory documents through the Data API envelope. |
+| `GET /v1/tenants/:tenant_id/data/records/:record_id` | Record lookup by id. |
+| `GET /v1/tenants/:tenant_id/data/records/:record_id/links` | Record links by id. |
+| `POST /v1/tenants/:tenant_id/data/query` | Flexible records query. |
+| `POST /v1/tenants/:tenant_id/data/retrieve` | Memory-oriented retrieval. |
+| `GET /v1/tenants/:tenant_id/data/views` | List saved Data Views. |
+| `POST /v1/tenants/:tenant_id/data/views` | Upsert a saved Data View. |
+| `GET /v1/tenants/:tenant_id/data/views/:view_id` | Fetch or re-run a saved Data View with `?run=true`. |
+
 ## Coordination
 
 The shared room where several heads see each other's work.
@@ -93,13 +124,14 @@ Search and ingest code as a graph.
 
 | Tool | What it does |
 |---|---|
-| `compute_code` | Native code discovery: search, context, explain, recognize, explore. |
-| `code_ingest` | Ingest or reindex a local repository into the code graph. |
+| `compute_code` | Combined CodeCrawler tool: ingest, reindex, search, context, explain, recognize, explore, list repos, status, context packs, and fact extraction aliases. |
+| `code_ingest` | Compatibility alias for heavy ingest/reindex paths; new callers can use `compute_code`. |
 | `code_compile_spec` | Compile CodeFile/CodeSymbol graph records into a CodeSpecification IR snapshot. |
 | `code_extract_features` | Extract code connection feature records from a repository code graph snapshot. |
 | `code_implementation_obligations` | Compile implementation obligations from code spec, feature, pattern, and drift evidence. |
 | `code_patterns_relevant` | Read relevant code pattern memories for a repository and query or path prefix. |
 | `code_spec_drift` | Compare a CodeSpecification against the current repository code graph snapshot. |
+| `understand_code` | Compose code graph search/context/explain plus Data API evidence into a feature map, component map, ownership map, call graph summary, and risk/evidence packet. |
 | `reverse_engineer_compose` | Compose source ensure, code compiler, Datawave projection, binary summary, and receipt writing into a ReconstructionSpec. |
 | `reverse_engineer_slice` | Select a bounded feature slice from a composed ReconstructionSpec. |
 | `reverse_engineer_behavior_ir` | Lower a feature slice into language-neutral behavior IR. |
@@ -107,8 +139,12 @@ Search and ingest code as a graph.
 | `reverse_engineer_emit` | Emit a conservative PatchSet scaffold and tests from behavior IR and a target plan. |
 | `reverse_engineer_validate` | Attach not-run validation receipts to an emitted PatchSet for the target checkout. |
 | `reverse_engineer_port` | Run compose -> slice -> behavior IR -> target plan -> emit -> validate and return all artifacts. |
+| `reconstruct` | Compound wrapper over `reverse_engineer_compose`, `reconstruct_binary`, and `datawave_ingest`; modes include `compose`, `binary`, `datawave`, `source_to_binary`, `slice`, `behavior_ir`, `target_plan`, `emit`, `validate`, and `port`, with stage receipts. |
 | `reconstruct_binary` | Load/analyze/lift binary artifacts through the reconstruction harness and return evidence-backed reconstruction receipts. |
 | `datawave_ingest` | Normalize records into Datawave-style field facts, entity edges, dictionary entries, and lookup/intersection receipts. |
+| `impact` | Blast radius wrapper over instant-KG impact plus Data API evidence. |
+| `oracle` | Validate a claim against graph verification and evidence; can write a `learn_pattern` receipt when explicitly requested in write-enabled mode. |
+| `observe_web` | Read URL/API/docs evidence from RustyWeb/Datawave records and expose it through the Data API envelope. |
 | `harness_kg_status` | Status of the merged code-graph view (base + session delta). |
 | `harness_kg_search` | Lexical code-object search. |
 | `harness_kg_ppr` | Rank code objects by relevance to seeds. |

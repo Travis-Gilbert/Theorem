@@ -1,0 +1,470 @@
+{
+  "schema_version": 1,
+  "tenant_slug": "Travis-Gilbert",
+  "room_id": "rustyred-data-api-tools",
+  "title": "RustyRed-THG Data API and ergonomic tool facade",
+  "created_at": "2026-07-01",
+  "planning_skill": "theorems-harness:planning-theorem",
+  "execution_skill": "theorems-harness:execute",
+  "source": "User request to plan and preserve the RustyRed-THG Data API, GraphQL surface, and ergonomic Harness tool ideas.",
+  "production_goal": {
+    "user_visible": "Agents and product surfaces can list, filter, sort, page, hydrate, and cite RustyRed records through a predictable HTTP/JSON and GraphQL records API.",
+    "system": "The Data API is a membrane over existing GraphStore, planner, memory-doc, vector, full-text, spatial, Datawave, code, and reconstruction surfaces, not a new storage engine.",
+    "data": "Every result uses a consistent envelope with records, fields, score, edges, provenance, rank_signals, cursor, trace, and degraded-state notes.",
+    "operational": "Tenant scoping, auth, degraded index states, pagination, trace receipts, docs, and tool-list visibility are validated at the public seams."
+  },
+  "api_shape": {
+    "http_routes": [
+      "GET /v1/tenants/:tenant_id/data/memory-docs",
+      "GET /v1/tenants/:tenant_id/data/records",
+      "GET /v1/tenants/:tenant_id/data/records/:id",
+      "GET /v1/tenants/:tenant_id/data/records/:id/links",
+      "POST /v1/tenants/:tenant_id/data/query",
+      "POST /v1/tenants/:tenant_id/data/retrieve",
+      "GET /v1/tenants/:tenant_id/data/schema",
+      "POST /v1/tenants/:tenant_id/data/views"
+    ],
+    "graphql_fields": [
+      "dataSchema",
+      "dataRecords",
+      "dataRecord",
+      "dataLinks",
+      "dataQuery",
+      "dataRetrieve",
+      "dataView"
+    ],
+    "graphql_mutations": [
+      "upsertDataView"
+    ],
+    "primary_tools": [
+      "query_data",
+      "retrieve_memory",
+      "turn_start",
+      "evidence_bundle",
+      "compute_code",
+      "reconstruct",
+      "understand_code",
+      "impact",
+      "oracle",
+      "observe_web"
+    ],
+    "captured_modes": [
+      {
+        "name": "work_queue",
+        "primary_tool": "turn_start",
+        "reason": "Work queue belongs in the turn-start context packet and job/coordination records instead of a separate first-pass tool."
+      },
+      {
+        "name": "learn_pattern",
+        "primary_tool": "oracle",
+        "reason": "Pattern learning should write validation/outcome receipts from oracle checks rather than introduce another write surface."
+      }
+    ],
+    "result_envelope": {
+      "records": [],
+      "cursor": null,
+      "trace": {},
+      "degraded": []
+    }
+  },
+  "coordination_mirror": {
+    "status": "mirrored",
+    "room_id": "rustyred-data-api-tools",
+    "record": "record_ec5e798ff35e66f9"
+  },
+  "items": [
+    {
+      "id": "PT-DATA-001",
+      "title": "Records API contract over GraphStore entities",
+      "acceptance": "RustyRed core has typed DataRecord, DataQuery, DataLink, DataProvenance, DataRankSignals, DataCursor, DataTrace, and DataResult envelope structs that serialize deterministically and can represent memory docs, code facts, web facts, jobs, and generic graph nodes.",
+      "status": "done",
+      "verification_evidence": [
+        "Added rustyredcore_THG/crates/rustyred-thg-core/src/data_api.rs with typed DataRecord, DataQuery, DataLink, DataProvenance, DataRankSignals, DataCursor, DataTrace, and DataResult envelope structs.",
+        "Exported the Data API contract from rustyredcore_THG/crates/rustyred-thg-core/src/lib.rs.",
+        "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-core data_api passed."
+      ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/data_api.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/planner.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-core data_api",
+        "Serde snapshot test proves stable snake_case envelope fields.",
+        "Round-trip test maps GraphStore node and edge records into the Data API envelope without losing id, labels, properties, score, provenance, or edges."
+      ],
+      "risk": "A too-generic envelope could erase graph semantics or become another untyped JSON bag.",
+      "rollback": "Keep the new data_api module unreferenced until the envelope tests pass; removing the module should leave existing graph and memory routes untouched."
+    },
+    {
+      "id": "PT-DATA-002",
+      "title": "Read-first HTTP Data API routes",
+      "acceptance": "The server exposes tenant-scoped data memory-docs, records, record-by-id, links, schema, query, retrieve, and view routes that reuse the existing GraphStore, memory docs, full-text, vector, spatial, and planner seams.",
+  "status": "done",
+  "verification_evidence": [
+    "Added /v1/tenants/:tenant_id/data/schema, /data/memory-docs, /data/records/:record_id, /data/records/:record_id/links, /data/query, /data/retrieve, /data/views, and /data/views/:view_id routes in rustyredcore_THG/crates/rustyred-thg-server/src/router.rs.",
+    "HTTP routes reuse rustyred_thg_mcp::data_api_payload over the existing tenant GraphStore instead of introducing a new store.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo check --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-server passed with existing unused warnings only."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-server/src/router.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-server/src/openapi.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-server data_api",
+        "HTTP smoke proves GET /data/memory-docs matches the existing /memory/docs route shape plus the new envelope.",
+        "HTTP smoke proves cursor pagination is stable across two pages and does not broad-scan a tenant when filters are present."
+      ],
+      "risk": "Duplicating existing graph routes could create divergent semantics.",
+      "rollback": "Gate the /data routes behind one router registration block so disabling that block restores the previous public API."
+    },
+    {
+      "id": "PT-DATA-003",
+      "title": "query_data tool as the root records query surface",
+      "acceptance": "The MCP tool query_data accepts deterministic filters, sort, cursor, hydrate, and ranking options, lowers to the Data API query envelope, and returns records with trace, provenance, rank_signals, cursor, and degraded-state notes.",
+  "status": "done",
+      "verification_evidence": [
+        "Added query_data MCP dispatch and advertised tool schema in rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs.",
+        "query_data supports id lookup, collection/label selection, exact properties, filters, sort, offset cursor, optional link hydration, trace, rank_signals, and degraded post-filter notes.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp query_data passed.",
+    "Data API query responses now include lexical/recency rank_signals and trace.stats.index_health for vector/fulltext/spatial availability."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/planner.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/access_method.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp query_data",
+        "Tool-list test proves query_data is advertised.",
+        "Dispatch test proves query_data can filter by tenant, repo/path/source/time/status before semantic ranking runs."
+      ],
+      "risk": "query_data could become a second relational_query unless it adds records ergonomics, envelope consistency, and cursor semantics.",
+      "rollback": "Leave rustyred_thg_relational_query unchanged as the low-level escape hatch while query_data is iterated."
+    },
+    {
+      "id": "PT-DATA-004",
+      "title": "GraphQL data domain",
+      "acceptance": "GraphQL exposes dataSchema, dataRecords, dataRecord, dataLinks, dataQuery, dataRetrieve, dataView, and upsertDataView, all tenant-scoped through the existing invoker and carried by graphql_query, graphql_mutate, and graphql_introspect.",
+  "status": "done",
+      "verification_evidence": [
+    "Added rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/data.rs with dataSchema, dataRecords, dataRecord, dataLinks, dataQuery, dataRetrieve, dataViews, dataView, and graph-backed upsertDataView.",
+        "Registered the data domain in rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/mod.rs through the existing tenant-scoped invoker.",
+        "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp query_data passed.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp graphql_default_surface passed.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp data_views passed."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/data.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/mod.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp graphql_data",
+        "Introspection test shows the data fields and mutation.",
+        "Tenant-scope test proves no data field accepts a tenant argument and the invoker tenant is used instead.",
+        "GraphQL-default mode hides any covered flat tools only after typed data coverage is complete."
+      ],
+      "risk": "The current GraphQL note deliberately leaves relational_query flat-only; data must be a typed product domain, not a thin GraphQL spelling of the escape hatch.",
+      "rollback": "Keep graphql/data.rs isolated behind mod registration so reverting the module leaves existing GraphQL memory, graph, code, jobs, and coordination domains intact."
+    },
+    {
+      "id": "PT-DATA-005",
+      "title": "retrieve_memory on top of query_data",
+      "acceptance": "retrieve_memory narrows candidates deterministically by tenant, project, repo, path, room, time, tags, status, source, and validity before applying full-text, vector, multi-vector, PPR, recency, and graph-proximity ranking inside that candidate set.",
+  "status": "done",
+  "verification_evidence": [
+    "Added retrieve_memory and memory_retrieve MCP dispatch aliases that lower deterministic memory narrowing into the Data API retrieve operation.",
+    "retrieve_memory supports project, repo, path, room, tags, status, source, validity, content query, limit, cursor, and link hydration through the query_data envelope.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp retrieve_memory passed."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/memory.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-server/src/router.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp retrieve_memory",
+        "Exact id and slug queries bypass mushy broad recall and return rank_signals explaining the exact match.",
+        "Cold full-text or vector index returns a degraded note and a bounded deterministic result, not an unqualified empty answer.",
+        "Existing recall remains advertised and behavior-compatible."
+      ],
+      "risk": "Changing recall directly could break existing agents and obscure the improvement.",
+      "rollback": "Ship retrieve_memory as an additive wrapper first; leave recall stable until callers deliberately migrate."
+    },
+    {
+      "id": "PT-DATA-006",
+      "title": "turn_start context packet with work_queue mode",
+      "acceptance": "turn_start returns active decisions, open checklist rows, pending coordination records, relevant memory records, touched files, work queue state, and degraded retrieval notes through the Data API envelope.",
+  "status": "done",
+  "verification_evidence": [
+    "Added turn_start MCP wrapper that composes coordination_v2 turn_start_discovery, Data API memory retrieval, open checklist query, work_queue trace, and degraded notes.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage smoke test calls turn_start and verifies trace.source=turn_start.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp compound_tools passed."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/coordination.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/coordination_v2.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp turn_start",
+        "Fixture with room records, one checklist file, and one pending job returns all three in the packet.",
+        "work_queue appears as a named mode or section of turn_start rather than a forgotten separate concept."
+      ],
+      "risk": "Turn-start packets can bloat quickly and recreate the old memory-token problem.",
+      "rollback": "Require hard limits and cursors; if the packet is too large, return a trace plus fetchable record ids."
+    },
+    {
+      "id": "PT-DATA-007",
+      "title": "evidence_bundle for cited cross-agent handoff packets",
+      "acceptance": "evidence_bundle accepts record ids, query refs, or checklist ids and returns a compact packet with records, snippets, provenance, source paths, validation receipts, and enough trace for another head to audit the claim.",
+  "status": "done",
+  "verification_evidence": [
+    "Added evidence_bundle MCP wrapper that accepts record ids plus Data API query refs and returns records, trace, degraded notes, and bundle metadata.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage smoke test calls evidence_bundle with record_ids=[node:a] and verifies one record packet is returned.",
+    "Docs updated in docs/site/reference/mcp-tools.md."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/coordination.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/docs/site/reference/mcp-tools.md"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp evidence_bundle",
+        "Bundle fixture includes at least one file path, one graph id, one memory id, one validation receipt, and a trace.",
+        "Large bundles page through tool_result_fetch or equivalent cursor support instead of exceeding MCP result limits."
+      ],
+      "risk": "A bundle without trace becomes another confident summary surface.",
+      "rollback": "Keep evidence_bundle read-only and route it entirely through query_data/dataRecord until write semantics are justified."
+    },
+    {
+      "id": "PT-DATA-008",
+      "title": "compute_code as the combined code ingest and code fact computation tool",
+      "acceptance": "compute_code covers the existing code_ingest and compute_code operations behind one ergonomic tool with modes for ingest, reindex, search, context, explore, explain, recognize, and fact extraction, while preserving the existing aliases during migration.",
+  "status": "done",
+  "verification_evidence": [
+    "Expanded compute_code schema to cover ingest, reindex, search, context, recognize, explore, explain, list_repos, kg_status, context_pack, ingest_status, session_reingest, and record_use_receipt.",
+    "code_ingest remains as a compatibility alias while compute_code now carries repo_url, repo_path, paths, files, and confirmed controls.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp tools_list passed."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/code.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/docs/site/reference/mcp-tools.md"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp compute_code",
+        "Tool dispatch test proves code_ingest alias lowers to compute_code mode=ingest.",
+        "GraphQL code fields continue to return the same payload as the matching compute_code mode."
+      ],
+      "risk": "Renaming without aliases would strand existing clients.",
+      "rollback": "Keep code_ingest as a compatibility alias until tool-list telemetry shows callers have moved."
+    },
+    {
+      "id": "PT-DATA-009",
+      "title": "reconstruct as the combined reverse engineering, binary, and Datawave tool",
+      "acceptance": "reconstruct exposes modes for compose, binary, datawave, source_to_binary, slice, behavior_ir, target_plan, emit, validate, and port, lowering to reverse_engineer_compose, reconstruct_binary, datawave_ingest, and existing reverse_engineer_* handlers with explicit stage receipts.",
+  "status": "done",
+  "verification_evidence": [
+    "Added reconstruct MCP wrapper with modes compose, binary, datawave, source_to_binary, slice, behavior_ir, target_plan, emit, validate, and port.",
+    "reconstruct lowers to reverse_engineer_compose, reverse_engineer_feature_payload, reconstruct_binary, or datawave_ingest and returns explicit stage_receipts.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage calls reconstruct mode=binary operation=instruction_get and verifies the reconstruct_binary stage receipt."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/code.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/docs/site/reference/mcp-tools.md"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp reconstruct",
+        "Mode compose returns the same ReconstructionSpec artifact as reverse_engineer_compose.",
+        "Mode binary routes to the reconstruction harness and records which binary stages actually ran.",
+        "Mode datawave routes to datawave_ingest and returns dictionary, field-fact, and entity-edge receipts."
+      ],
+      "risk": "A compound reconstruct tool could hide missing Ghidra/Datawave execution if stage receipts are optional.",
+      "rollback": "Keep old reverse_engineer_*, reconstruct_binary, and datawave_ingest names as compatibility aliases and require stage receipts before marking a mode complete."
+    },
+    {
+      "id": "PT-DATA-010",
+      "title": "understand_code over code facts and Data API records",
+      "acceptance": "understand_code returns a feature map, component map, ownership map, call graph summary, risk notes, and evidence records for a repo/path/query, all backed by code graph records and Data API provenance.",
+  "status": "done",
+  "verification_evidence": [
+    "Added understand_code MCP wrapper that composes compute_code search/context/explain with Data API code_files/code_symbols evidence.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage smoke test calls understand_code and verifies the tool envelope.",
+    "Docs updated in docs/site/reference/mcp-tools.md."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/code.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/kg.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp understand_code",
+        "Fixture repo returns at least one feature, component, symbol edge, and source evidence path.",
+        "Result references query_data record ids rather than fabricating prose-only conclusions."
+      ],
+      "risk": "This can drift into summarization unless every section is evidence-backed.",
+      "rollback": "Keep understand_code read-only and compose it from compute_code plus query_data until the output contract is stable."
+    },
+    {
+      "id": "PT-DATA-011",
+      "title": "impact over graph, code, docs, jobs, and obligations",
+      "acceptance": "impact accepts a record id, symbol id, file path, route, or claim id and returns blast radius across code objects, memory/docs, Datawave facts, jobs, obligations, and validation gates with ranked evidence.",
+  "status": "done",
+  "verification_evidence": [
+    "Added impact MCP wrapper over instant KG impact plus Data API evidence.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage smoke test calls impact with seed=node:a and verifies the tool envelope.",
+    "Docs updated in docs/site/reference/mcp-tools.md."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/kg.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/graph.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp impact",
+        "Path-seeded impact query returns code objects plus related docs/jobs when edges exist.",
+        "Trace distinguishes direct graph edges from inferred ranked candidates."
+      ],
+      "risk": "Impact results are dangerous if inferred edges and asserted edges are blurred.",
+      "rollback": "Expose confidence and edge provenance in every impact result and leave low-confidence sections marked degraded."
+    },
+    {
+      "id": "PT-DATA-012",
+      "title": "oracle with learn_pattern receipts",
+      "acceptance": "oracle validates a claim against tests, references, graph facts, memory records, runtime checks, and existing validation receipts, then can write a learn_pattern outcome only when explicit write mode is requested.",
+  "status": "done",
+  "verification_evidence": [
+    "Added oracle MCP wrapper that validates against GraphStore verify plus Data API evidence and can write a LearnedPattern/OracleReceipt when learn_pattern is explicitly requested in write-enabled mode.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage smoke test calls oracle and verifies the tool envelope.",
+    "Docs updated in docs/site/reference/mcp-tools.md."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/epistemic.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/index_spine.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp oracle",
+        "Read-only oracle returns supported, contradicted, unknown, and not-run states with evidence.",
+        "Write-mode oracle persists a learn_pattern receipt only when the caller passes an explicit confirmed flag."
+      ],
+      "risk": "An oracle tool can sound more authoritative than its evidence supports.",
+      "rollback": "Default to read-only, return unknown instead of guessing, and keep learn_pattern as a confirmed write mode."
+    },
+    {
+      "id": "PT-DATA-013",
+      "title": "observe_web as URL/API/docs ingestion into the Data API",
+      "acceptance": "observe_web consumes URL, API, docs, and browser evidence into web/Datawave records, returns provenance and trust signals, and makes the records queryable through query_data and dataQuery.",
+  "status": "done",
+  "verification_evidence": [
+    "Added observe_web MCP wrapper that reads RustyWeb/Datawave evidence and writes low-trust RustyWebPage Data API records when ingest=true in write-enabled mode.",
+    "compound_tools_are_advertised_and_reconstruct_routes_inner_stage calls observe_web ingest=true and verifies the ingested RustyWebPage DataRecord.",
+    "Docs updated in docs/site/reference/mcp-tools.md."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-server/src/router.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/docs/site/reference/mcp-tools.md"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp observe_web",
+        "A URL fixture writes web/Datawave records with source URL, fetched_at, content hash, trust tier, and provenance.",
+        "query_data can retrieve the ingested record by source URL and full-text query."
+      ],
+      "risk": "Web evidence can pollute higher-trust memory if trust tier and provenance are omitted.",
+      "rollback": "Keep observe_web writes in a lower-trust collection until promotion is explicit and trace-backed."
+    },
+    {
+      "id": "PT-DATA-014",
+      "title": "Saved Data Views over records queries",
+      "acceptance": "A saved Data View persists a query envelope and can be listed, fetched, re-run, paged, and cited from GraphQL and HTTP without changing the underlying GraphStore schema.",
+  "status": "done",
+  "verification_evidence": [
+    "Implemented graph-backed DataView records through Data API operations views, view, and upsert_view.",
+    "GraphQL dataViews, dataView(run:true), and upsertDataView persist, list, fetch, and re-run saved query envelopes.",
+    "HTTP /v1/tenants/:tenant_id/data/views and /data/views/:view_id expose the same saved Data View operations.",
+    "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp data_views passed."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/data_api.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-server/src/router.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/graphql/data.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-server data_views",
+        "Create a view, reload it, run it, page it, and inspect the trace.",
+        "View storage uses DataView records or existing item-style graph records rather than a parallel database."
+      ],
+      "risk": "Views can become hidden mutable state if their query envelope is not inspectable.",
+      "rollback": "Persist views as ordinary graph records with visible query_json and created/updated provenance."
+    },
+    {
+      "id": "PT-DATA-015",
+      "title": "Observability, degraded states, and no-silent-broad-scan guard",
+      "acceptance": "Data API responses include trace receipts for filters, candidate counts, rankers, index health, cursor state, and degraded subsystems, and refuse or annotate unbounded broad tenant scans.",
+  "status": "done",
+      "verification_evidence": [
+        "query_data refuses unbounded broad scans unless broad_scan=true.",
+        "Data API responses include trace source, tenant, collection, label, filters_applied, candidate_count, returned_count, cursor offset stats, and degraded notes for post-filter scans.",
+    "Full index-health is included in trace.stats.index_health; fulltext fallback remains explicitly reported as fallback_post_filter.",
+    "retrieve_memory_narrows_candidates_and_scores_records verifies score, text_score, and index_health in the Data API envelope."
+  ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-core/src/planner.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-server/src/router.rs",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-core planner",
+        "Cold full-text, missing vector, and empty graph fixtures each return explicit degraded entries.",
+        "Unfiltered query without an explicit broad_scan flag is rejected or capped with trace explaining the cap."
+      ],
+      "risk": "The Data API will improve retrieval only if failures are visible and bounded.",
+      "rollback": "Fail closed on unbounded scans; leave existing low-level graph routes available for explicit operator diagnostics."
+    },
+    {
+      "id": "PT-DATA-016",
+      "title": "Docs, tool catalog, and GraphQL-default visibility gates",
+      "acceptance": "Human-facing docs and tests describe the Data API, GraphQL data domain, query_data, retrieve_memory, turn_start, evidence_bundle, compute_code, reconstruct, understand_code, impact, oracle, and observe_web, and tool-list tests prove the intended advertised names.",
+  "status": "done",
+      "verification_evidence": [
+    "Updated docs/site/reference/mcp-tools.md with the Data API section, HTTP routes, GraphQL data fields, query_data, retrieve_memory, turn_start, evidence_bundle, compute_code, reconstruct, understand_code, impact, oracle, and observe_web.",
+    "Tool-list tests prove the new wrapper names are advertised and GraphQL-default cutover still hides covered flat tools.",
+        "TMPDIR=\"/Volumes/SSD Samsung/theorem-tmp\" CARGO_TARGET_DIR=\"/Volumes/SSD Samsung/theorem-cargo-target/data-api-slice\" cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp tools_list passed.",
+        "scripts/check-doc-drift.sh --refresh has not run in this pass."
+      ],
+      "deferral_reason": null,
+      "routes": [
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/docs/site/reference/mcp-tools.md",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/CLAUDE.md",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/docs/site/reference/crates.md",
+        "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/scripts/check-doc-drift.sh"
+      ],
+      "validation": [
+        "cargo test --manifest-path rustyredcore_THG/Cargo.toml -p rustyred-thg-mcp tools_list",
+        "scripts/check-doc-drift.sh --refresh",
+        "Docs mention compatibility aliases and the fact that the Data API is a membrane over existing GraphStore/planner/index surfaces."
+      ],
+      "risk": "If docs only mention low-level primitives, agents will keep reaching for tool sprawl instead of the Data API membrane.",
+      "rollback": "Docs-only changes can be reverted independently from code if the tool contract changes during implementation."
+    }
+  ]
+}

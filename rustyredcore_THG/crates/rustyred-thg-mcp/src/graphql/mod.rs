@@ -88,6 +88,7 @@ mod clusters;
 mod code;
 mod coordination;
 mod coordination_v2;
+mod data;
 mod epistemic;
 mod graph;
 mod index_spine;
@@ -161,6 +162,8 @@ pub(crate) trait GraphqlInvoker {
     // Code domain (A5): wraps the CodeCrawler compute_code payload, parameterized
     // by operation (search / context / explore / explain / ingest / reindex / ...).
     fn code(&self, operation: &str, args: Value) -> Result<Value, McpError>;
+    // Data domain: the records/query membrane over graph, memory, and planner surfaces.
+    fn data(&self, operation: &str, args: Value) -> Result<Value, McpError>;
     // Harness instant-KG domain (A5, KG half): wraps the consolidated
     // instant_kg_payload, parameterized by operation.
     fn instant_kg(&self, operation: &str, args: Value) -> Result<Value, McpError>;
@@ -428,6 +431,14 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
             operation,
         )
     }
+    fn data(&self, operation: &str, args: Value) -> Result<Value, McpError> {
+        crate::data_api_payload(
+            &self.tenant,
+            &mut *self.backend.borrow_mut(),
+            &args,
+            operation,
+        )
+    }
     fn instant_kg(&self, operation: &str, args: Value) -> Result<Value, McpError> {
         crate::instant_kg_payload(
             &self.tenant,
@@ -556,6 +567,7 @@ pub(crate) struct QueryRoot(
     coordination_v2::CoordinationV2Query,
     epistemic::EpistemicQuery,
     code::CodeQuery,
+    data::DataQuery,
     kg::HarnessKgQuery,
     clusters::ClustersQuery,
     index_spine::IndexSpineQuery,
@@ -570,6 +582,7 @@ pub(crate) struct MutationRoot(
     coordination_v2::CoordinationV2Mutation,
     epistemic::EpistemicMutation,
     code::CodeMutation,
+    data::DataMutation,
     clusters::ClustersMutation,
     items::ItemMutation,
 );
