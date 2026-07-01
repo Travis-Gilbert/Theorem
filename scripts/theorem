@@ -30,6 +30,9 @@ Commands:
   serve-model [config]     Start the local mistral.rs model host.
   up                       Start local RustyRed node plus model-path proxy.
   proxy [proxy args...]    Start the Anthropic Messages proxy on localhost.
+  graph <command> [args...] Query file graph context for Yazi and shell workflows.
+  federation <command> [args...]
+                           Inspect or run the opt-in Iroh federation lane.
   connect <claude|codex> [--check]
                            Point an agent at the local proxy, reversibly.
   disconnect <claude|codex>
@@ -143,6 +146,32 @@ find_theorem_proxy_bin() {
         fi
         if [[ -x "$repo/apps/theorem-proxy/target/debug/theorem-proxy" ]]; then
             printf '%s\n' "$repo/apps/theorem-proxy/target/debug/theorem-proxy"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+find_federation_bin() {
+    if [[ -n "${THEOREM_FEDERATION_BIN:-}" && -x "$THEOREM_FEDERATION_BIN" ]]; then
+        printf '%s\n' "$THEOREM_FEDERATION_BIN"
+        return 0
+    fi
+
+    if command -v theorem-federation >/dev/null 2>&1; then
+        command -v theorem-federation
+        return 0
+    fi
+
+    local repo
+    if repo="$(find_repo 2>/dev/null)"; then
+        if [[ -x "$repo/apps/theorem-federation/target/release/theorem-federation" ]]; then
+            printf '%s\n' "$repo/apps/theorem-federation/target/release/theorem-federation"
+            return 0
+        fi
+        if [[ -x "$repo/apps/theorem-federation/target/debug/theorem-federation" ]]; then
+            printf '%s\n' "$repo/apps/theorem-federation/target/debug/theorem-federation"
             return 0
         fi
     fi
@@ -427,6 +456,27 @@ cmd_proxy() {
         exec_proxy "$@" "$config_path"
     fi
     exec_proxy "$@"
+}
+
+cmd_graph() {
+    local proxy_bin
+    if proxy_bin="$(find_theorem_proxy_bin)"; then
+        exec "$proxy_bin" graph "$@"
+    fi
+    local repo
+    repo="$(find_repo)"
+    exec cargo run --manifest-path "$repo/apps/theorem-proxy/Cargo.toml" -- graph "$@"
+}
+
+cmd_federation() {
+    local federation_bin
+    if federation_bin="$(find_federation_bin)"; then
+        "$federation_bin" "$@"
+        return
+    fi
+    local repo
+    repo="$(find_repo)"
+    cargo run --manifest-path "$repo/apps/theorem-federation/Cargo.toml" -- "$@"
 }
 
 cmd_harness() {
@@ -1391,6 +1441,11 @@ cmd_status() {
     else
         printf 'theorem-proxy binary: not found\n'
     fi
+    if find_federation_bin >/dev/null; then
+        printf 'theorem-federation binary: %s\n' "$(find_federation_bin)"
+    else
+        printf 'theorem-federation binary: cargo fallback\n'
+    fi
     if http_ok "$(node_base_url)/ready"; then
         printf 'node: ready (%s)\n' "$(node_base_url)"
     elif [[ -f "$NODE_PID_FILE" ]]; then
@@ -1503,6 +1558,15 @@ cmd_doctor() {
         ok=false
     fi
 
+    case "${THEOREM_FEDERATION_ENABLED:-}" in
+        1 | true | TRUE | yes | YES | on | ON)
+            cmd_federation doctor --bind-endpoint || ok=false
+            ;;
+        *)
+            cmd_federation doctor >/dev/null || log "federation doctor skipped; build apps/theorem-federation for full status"
+            ;;
+    esac
+
     if [[ "$ok" == "true" ]]; then
         log "doctor passed"
         return 0
@@ -1534,6 +1598,12 @@ main() {
             ;;
         proxy)
             cmd_proxy "$@"
+            ;;
+        graph)
+            cmd_graph "$@"
+            ;;
+        federation)
+            cmd_federation "$@"
             ;;
         connect)
             cmd_connect "$@"

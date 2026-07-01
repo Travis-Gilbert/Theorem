@@ -16,6 +16,7 @@ rustyred-fuse
 rustyred-git
 rustyred-workspace
 theorem-agentd
+theorem-federation
 theorem-gateway
 theorem-grpc
 theorem-harness-node
