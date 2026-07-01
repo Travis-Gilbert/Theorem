@@ -2875,15 +2875,42 @@ impl McpGraphBackend for ProductMcpBackend {
                     McpError::internal(format!("dispatch runtime build failed: {error}"))
                 })?;
             runtime.block_on(async move {
-                let url = format!(
-                    "https://api.github.com/repos/{}/{}/dispatches",
-                    dispatch.owner, dispatch.repo
-                );
+                let HandoffDispatch {
+                    owner,
+                    repo,
+                    event_type,
+                    tenant,
+                    room_id,
+                    actor,
+                    dispatch_id,
+                    intent,
+                    branch,
+                    metadata,
+                } = dispatch;
+                let wake_message_id = metadata
+                    .get("wake_message_id")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let wake_author = metadata.get("wake_author").cloned().unwrap_or(Value::Null);
+                let wake_delivery = metadata
+                    .get("wake_delivery")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let url = format!("https://api.github.com/repos/{}/{}/dispatches", owner, repo);
                 let body = json!({
-                    "event_type": dispatch.event_type,
+                    "event_type": event_type,
                     "client_payload": {
-                        "intent": dispatch.intent,
-                        "branch": dispatch.branch,
+                        "intent": intent,
+                        "branch": branch,
+                        "tenant": tenant.clone(),
+                        "tenant_slug": tenant,
+                        "room_id": room_id,
+                        "actor": actor,
+                        "dispatch_id": dispatch_id,
+                        "wake_message_id": wake_message_id,
+                        "wake_author": wake_author,
+                        "wake_delivery": wake_delivery,
+                        "metadata": metadata,
                     },
                 });
                 let response = reqwest::Client::new()

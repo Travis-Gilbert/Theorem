@@ -118,8 +118,13 @@ pub struct HandoffDispatch {
     pub owner: String,
     pub repo: String,
     pub event_type: String,
+    pub tenant: String,
+    pub room_id: String,
+    pub actor: String,
+    pub dispatch_id: String,
     pub intent: String,
     pub branch: String,
+    pub metadata: Map<String, Value>,
 }
 
 fn publish_coordination_room_event(state: &CoordinationMessageState) {
@@ -5906,6 +5911,7 @@ fn spawn_session_payload(
     metadata.insert("executor".to_string(), json!("github_actions"));
     metadata.insert("event_type".to_string(), json!(event_type));
     metadata.insert("intent".to_string(), json!(intent));
+    let dispatch_metadata = metadata.clone();
 
     let record = write_coordination_record(
         backend,
@@ -5928,8 +5934,13 @@ fn spawn_session_payload(
         owner: owner.clone(),
         repo: repo.clone(),
         event_type,
+        tenant: tenant.to_string(),
+        room_id: room_id.clone(),
+        actor: actor_id.clone(),
+        dispatch_id: dispatch_id.clone(),
         intent,
         branch: branch.clone(),
+        metadata: dispatch_metadata,
     }) {
         Ok(()) => ("running", None),
         Err(error) => {
