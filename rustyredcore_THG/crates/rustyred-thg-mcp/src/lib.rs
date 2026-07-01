@@ -5951,6 +5951,7 @@ fn spawn_session_payload(
                 &dispatch_id,
                 "dispatch_failed",
                 None,
+                Some(error.message.as_str()),
             );
             ("dispatch_failed", Some(error.message))
         }
@@ -5981,6 +5982,7 @@ fn update_spawn_record_status(
     dispatch_id: &str,
     status: &str,
     pr_url: Option<&str>,
+    dispatch_error: Option<&str>,
 ) -> Result<Option<CoordinationRecordState>, McpError> {
     let records =
         read_coordination_records(&*backend, tenant, room_id, &["event".to_string()], 200)?;
@@ -5993,6 +5995,11 @@ fn update_spawn_record_status(
     record.metadata.insert("status".to_string(), json!(status));
     if let Some(url) = pr_url {
         record.metadata.insert("pr_url".to_string(), json!(url));
+    }
+    if let Some(error) = dispatch_error {
+        record
+            .metadata
+            .insert("dispatch_error".to_string(), json!(error));
     }
     persist_coordination_record(backend, &record)?;
     Ok(Some(record))
