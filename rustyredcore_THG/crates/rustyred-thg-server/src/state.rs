@@ -2912,7 +2912,6 @@ impl McpGraphBackend for ProductMcpBackend {
                     "client_payload": {
                         "intent": intent,
                         "branch": branch,
-                        "tenant": tenant.clone(),
                         "tenant_slug": tenant,
                         "room_id": room_id,
                         "actor": actor,
