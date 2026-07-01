@@ -49,8 +49,8 @@ use rustyred_thg_fractal::{
     run_fractal_expansion, run_fractal_expansion_with_search_providers, FractalExpansionRequest,
 };
 use rustyred_thg_mcp::{
-    agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpGraphBackend,
-    McpGraphProvider, McpRequestContext,
+    agent_manifest, data_api_payload, handle_mcp_request_with_context, mcp_manifest,
+    McpGraphBackend, McpGraphProvider, McpRequestContext,
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
@@ -532,6 +532,29 @@ pub fn build_router(state: AppState) -> Router {
             post(graph_neighbors),
         )
         .route("/v1/tenants/:tenant_id/graph/stats", get(graph_stats))
+        .route("/v1/tenants/:tenant_id/data/schema", get(data_schema))
+        .route(
+            "/v1/tenants/:tenant_id/data/memory-docs",
+            get(data_memory_docs),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/data/records/:record_id",
+            get(data_record_get),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/data/records/:record_id/links",
+            get(data_record_links),
+        )
+        .route("/v1/tenants/:tenant_id/data/query", post(data_query))
+        .route("/v1/tenants/:tenant_id/data/retrieve", post(data_retrieve))
+        .route(
+            "/v1/tenants/:tenant_id/data/views",
+            get(data_views).post(data_view_upsert),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/data/views/:view_id",
+            get(data_view_get),
+        )
         .route(
             "/v1/tenants/:tenant_id/inspection",
             get(inspection_overview),
@@ -6344,6 +6367,157 @@ async fn graph_stats(
         Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),
         Err(error) => graph_store_error_response(error),
     }
+}
+
+async fn data_schema(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    data_api_http_response(state, tenant_id, headers, json!({}), "schema", false)
+}
+
+async fn data_memory_docs(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    let mut args = data_query_params(params);
+    args["collection"] = json!("memory_docs");
+    data_api_http_response(state, tenant_id, headers, args, "query", false)
+}
+
+async fn data_record_get(
+    State(state): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    let mut args = data_query_params(params);
+    args["id"] = json!(record_id);
+    data_api_http_response(state, tenant_id, headers, args, "record", false)
+}
+
+async fn data_record_links(
+    State(state): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    let mut args = data_query_params(params);
+    args["id"] = json!(record_id);
+    data_api_http_response(state, tenant_id, headers, args, "links", false)
+}
+
+async fn data_query(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    data_api_http_response(state, tenant_id, headers, body, "query", false)
+}
+
+async fn data_retrieve(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    data_api_http_response(state, tenant_id, headers, body, "retrieve", false)
+}
+
+async fn data_views(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    data_api_http_response(
+        state,
+        tenant_id,
+        headers,
+        data_query_params(params),
+        "views",
+        false,
+    )
+}
+
+async fn data_view_get(
+    State(state): State<AppState>,
+    Path((tenant_id, view_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> axum::response::Response {
+    let mut args = data_query_params(params);
+    args["id"] = json!(view_id);
+    data_api_http_response(state, tenant_id, headers, args, "view", false)
+}
+
+async fn data_view_upsert(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    data_api_http_response(state, tenant_id, headers, body, "upsert_view", true)
+}
+
+fn data_api_http_response(
+    state: AppState,
+    tenant_id: String,
+    headers: HeaderMap,
+    args: Value,
+    operation: &'static str,
+    write: bool,
+) -> axum::response::Response {
+    let scope = if write { "graph:write" } else { "graph:read" };
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match data_api_payload(&tenant_id, &mut store, &args, operation) {
+        Ok(payload) => {
+            Json(json!({ "ok": true, "tenant": tenant_id, "data": payload })).into_response()
+        }
+        Err(error) => (
+            if error.code == -32602 {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            Json(mcp_error_payload(error)),
+        )
+            .into_response(),
+    }
+}
+
+fn data_query_params(params: BTreeMap<String, String>) -> Value {
+    let mut object = Map::new();
+    for (key, value) in params {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = if matches!(trimmed, "true" | "false") {
+            json!(trimmed == "true")
+        } else if let Ok(number) = trimmed.parse::<u64>() {
+            json!(number)
+        } else {
+            json!(trimmed)
+        };
+        object.insert(key, parsed);
+    }
+    Value::Object(object)
 }
 
 async fn inspection_overview(

@@ -11,6 +11,7 @@ pub mod cold_index;
 pub mod commands;
 pub mod context_view;
 pub mod crdt;
+pub mod data_api;
 pub mod doc_tree;
 pub mod epistemic;
 pub mod errors;
@@ -90,6 +91,11 @@ pub use context_view::{ContextView, ContextViewType, FreshnessStatus, HydrationH
 pub use crdt::{
     diff_since, join_delta, ActorId, Hlc, HlcClock, JoinReport, StampedBatch, StampedMutation,
     VersionVector,
+};
+pub use data_api::{
+    DataCursor, DataDegradedState, DataFilter, DataFilterOperator, DataHydrate, DataLink,
+    DataProvenance, DataQuery, DataRankSignals, DataRecord, DataResult, DataScope, DataSort,
+    DataSortDirection, DataTrace, DEFAULT_DATA_QUERY_LIMIT, MAX_DATA_QUERY_LIMIT,
 };
 pub use doc_tree::{
     DocEntry, DocTree, PathKey, DEFAULT_INLINE_THRESHOLD, DOC_TREE_CONTENT_HASH_PROPERTY,
